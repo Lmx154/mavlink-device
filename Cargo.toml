@@ -1,0 +1,24 @@
+[package]
+name = "mavlink-device"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "MAVLink 2 device layer for a flight controller: sans-IO core (framing, heartbeat, ground-station presence, stream scheduler, status text queue) over any byte stream."
+
+[features]
+defmt = ["dep:defmt", "embedded-io-async/defmt"]
+
+[dependencies]
+marv-dialect = { path = "../marv-dialect" }
+embedded-io-async = "0.7"
+embedded-hal-async = "1.0"
+defmt = { version = "1.0.1", optional = true }
+
+[workspace]
+exclude = ["hil"]
+
+[dev-dependencies]
+mavlink = { version = "=0.21.0", default-features = false, features = ["std", "serde", "dialect-common", "mav2-message-extensions"] }
+proptest = "1.12"
+marv-dialect = { path = "../marv-dialect", features = ["std"] }
