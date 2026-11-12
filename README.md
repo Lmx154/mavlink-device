@@ -88,15 +88,39 @@ All counters saturate and survive `on_link_down`. Made real by the parameter pro
 
 ## Not covered and not verified
 
-- Nothing has run on a board: no USB, no real clock, no real `ParamStore`. The behaviour is checked on the host against fakes and against the `mavlink` 0.21.0 crate.
+- **Windows and macOS.** Everything in "Measured on the MARV V2 Rev 1 board" ran against one Linux computer (kernel 7.0.0-42, `cdc_acm`, the `serialport` 4.x crate). How another host's terminal layer treats the first bytes after an open is not known; the start gate below is built from the Linux measurement.
+- **A USB-serial adapter on the computer.** Its cooked window is the same kind and the vehicle cannot see it; the ground station must resynchronise at the start of any session. Not run.
+- **Long runs.** The longest session on the board is 20 s (`t1`) with 5 s recordings; nothing ran for minutes or hours, so a counter that wraps, a drift of the clock or a leak is not excluded (the sequence number wraps every 256 frames and did so many times).
+- **Real sensors.** The firmware is a demonstration: every value is computed from the clock, the parameters live in RAM, there is no flight logic. Load, timing and jitter with real drivers on the same executor are not measured.
+- The behaviour of the crate itself is checked on the host against fakes and against the `mavlink` 0.21.0 crate, and with the demonstration on the board as listed below.
 - Signalling-NaN payloads in `I32` parameters rely on the platform (see above); only checked on x86-64.
 - Not covered by design: signing, MAVLink 1, PARAM_EXT, PARAM_ERROR, COMMAND_INT, missions, persistence of parameters, more parameter types than INT32 and REAL32.
-- `run`'s behaviour with a real cancel-safe USB reader, its stack use (about 350 bytes of buffers in the future, on top of the `Node`) and the throughput at the fastest rates are unmeasured.
+- The throughput at the fastest rates is unmeasured on the board (only the default rates ran).
 - A very long write (a host that stops reading) blocks the link task; the node does not time it out.
 
-## Measured on the board
+## The start gate (what the application provides on USB)
 
-Nothing yet.
+The crate has no gate: on a USB link the firmware's link task holds its first write after each link-up until the computer has opened the port. In `hil/src/bin/mavlink_demo.rs` the loop is `link.wait_up()`, `start_gate`, `node.run`, `node.on_link_down()`. The gate writes nothing; it waits for the first of bytes from `rx` and a 5 ms timer, gives the bytes to `Node::receive`, and opens when `Node::gcs_present` is true or when `Link::dtr()` has read true at every check for 100 ms. A read error ends it (link down). After it the node runs as before, also into a closed port. Why: `docs/link-contract.md` of MARV-GCS (section 3, "The start gate") and `usb-cdc/README.md`.
+
+## Measured on the MARV V2 Rev 1 board
+
+All of it with `mavlink_demo` (`hil/src/bin/mavlink_demo.rs`, started through `tools/run.sh`) against the ground station's tests `crates/marv-gcs/tests/board.rs`, run by `MARV-GCS/tools/board_check.sh` (three phases, the device program restarted before each), on one Linux computer, two complete passes (`final1`, `final2`). Where the two passes differ both numbers are given.
+
+| What | Number | Measured by |
+|---|---|---|
+| Time from the port open to Connected | 20 ms (the first 20 ms poll), both passes | `t1` |
+| Rates after 10 s | HIGHRES_IMU 50.000 to 50.002 Hz for each of 4 instances, SCALED_PRESSURE 10.000, GPS_RAW_INT 5.000, HEARTBEAT 1.000 Hz | `t1` |
+| First 20 s of the first session after a restart | 4343 frames, 0 checksum errors, 0 discarded bytes, 0 lost frames, both passes | `t1` |
+| First byte read, first frame | 0xFD; HEARTBEAT, sequence number 0 | `t1` (recording reader, then the deframer) |
+| Start-up text `MARV link demo ready` | in the state at the first poll after Connected (0 ms), both passes | `t1` |
+| A listener that sends nothing | first byte 103.1 / 102.4 ms after the open returned; 628 frames in 3 s, 0 checksum errors, 0 discarded bytes, first sequence 0 then consecutive, text among them. The board logged `gate open by DTR` 325 / 250 ms after link-up | `listen_only` |
+| A host that keeps DTR low | 0 bytes in the first second; first whole frame 0.6 ms after the ground-station HEARTBEAT was written, sequence 0; 650 frames in 3 s, 0 errors, 0 discarded bytes. The board logged `gate open by HEARTBEAT ... dtr false` after 1138 / 1199 ms | `no_dtr` |
+| Parameters | 13 listed exactly in 20 ms; ten refreshes 41 ms each (40 ms once); a write confirmed in 20 ms; read-only refused with the old value in effect; 5000 clamped to 1000 | `t2`, `t3` |
+| Recording | 1103 frames, 87253 bytes, 1103 records (1097 from the vehicle, 6 from the ground station), the same 1103 decoded by pymavlink, 0 BAD_DATA | `t4` and `tools/board_check.sh` |
+| Reconnect after a close | Connected in 20 ms, list in 20 ms | `t5` |
+| Sizes on the board | `Node` 1952 bytes, the `run` future 536 bytes, `Params` 260 bytes | start-up lines of `mavlink_demo` |
+
+With the gate switched off by a temporary edit of the firmware, `t1` did not receive the start-up text, `listen_only` read 0xC5 as its first byte and `no_dtr` read 15792 bytes in the silent second (see the report of the integration run).
 
 ## Tests
 
