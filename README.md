@@ -1,8 +1,8 @@
 # mavlink-device
 
-MAVLink 2 device layer for the MARV V2 flight controller. The crate is `no_std` and runs on any byte stream: it knows nothing about USB, a transport or an executor ("usb lives alone, mavlink is a layer on top of it"). `Node` is a sans-IO core: bytes and a time in, frames out. Messages come from `marv-dialect`, re-exported as `mavlink_device::dialect`. The only other dependencies are `embedded-io-async` 0.7 and `embedded-hal-async` 1.0 (for the async `Node::run`) and, optionally, `defmt`.
+MAVLink 2 device layer for the MARV V2 flight controller. The crate is `no_std` and runs on any byte stream: it knows nothing about USB, a transport or an executor ("usb lives alone, mavlink is a layer on top of it"). `Node` is a sans-IO core: bytes and a time in, frames out. Messages come from [`marv-dialect`](https://github.com/Lmx154/marv-dialect) (a git dependency pinned to a commit in `Cargo.toml`), re-exported as `mavlink_device::dialect`. The only other dependencies are `embedded-io-async` 0.7 and `embedded-hal-async` 1.0 (for the async `Node::run`) and, optionally, `defmt`.
 
-**Status: version 0.1.0 (`publish = false`). The core is complete on the host and has not run on a board; the API may still change.** The contract is `MARV-GCS/docs/link-contract.md`, sections 2 and 4.
+**Status: version 0.1.0 (`publish = false`). The core is complete on the host and has not run on a board; the API may still change.** The contract is [`docs/link-contract.md` of MARV-GCS](https://github.com/Lmx154/MARV-GCS/blob/main/docs/link-contract.md), sections 2 and 4.
 
 ## What is here
 
@@ -100,11 +100,11 @@ All counters saturate and survive `on_link_down`. Made real by the parameter pro
 
 ## The start gate (what the application provides on USB)
 
-The crate has no gate: on a USB link the firmware's link task holds its first write after each link-up until the computer has opened the port. In `hil/src/bin/mavlink_demo.rs` the loop is `link.wait_up()`, `start_gate`, `node.run`, `node.on_link_down()`. The gate writes nothing; it waits for the first of bytes from `rx` and a 5 ms timer, gives the bytes to `Node::receive`, and opens when `Node::gcs_present` is true or when `Link::dtr()` has read true at every check for 100 ms. A read error ends it (link down). After it the node runs as before, also into a closed port. Why: `docs/link-contract.md` of MARV-GCS (section 3, "The start gate") and `usb-cdc/README.md`.
+The crate has no gate: on a USB link the firmware's link task holds its first write after each link-up until the computer has opened the port. In `hil/src/bin/mavlink_demo.rs` the loop is `link.wait_up()`, `start_gate`, `node.run`, `node.on_link_down()`. The gate writes nothing; it waits for the first of bytes from `rx` and a 5 ms timer, gives the bytes to `Node::receive`, and opens when `Node::gcs_present` is true or when `Link::dtr()` has read true at every check for 100 ms. A read error ends it (link down). After it the node runs as before, also into a closed port. Why: [`docs/link-contract.md` of MARV-GCS](https://github.com/Lmx154/MARV-GCS/blob/main/docs/link-contract.md) (section 3, "The start gate") and the README of [`usb-cdc`](https://github.com/Lmx154/usb-cdc).
 
 ## Measured on the MARV V2 Rev 1 board
 
-All of it with `mavlink_demo` (`hil/src/bin/mavlink_demo.rs`, started through `tools/run.sh`) against the ground station's tests `crates/marv-gcs/tests/board.rs`, run by `MARV-GCS/tools/board_check.sh` (three phases, the device program restarted before each), on one Linux computer, two complete passes (`final1`, `final2`). Where the two passes differ both numbers are given.
+All of it with `mavlink_demo` (`hil/src/bin/mavlink_demo.rs`, started through `tools/run.sh`) against the ground station's tests `crates/marv-gcs/tests/board.rs`, run by `tools/board_check.sh` of [MARV-GCS](https://github.com/Lmx154/MARV-GCS) (three phases, the device program restarted before each), on one Linux computer, two complete passes (`final1`, `final2`). Where the two passes differ both numbers are given.
 
 | What | Number | Measured by |
 |---|---|---|

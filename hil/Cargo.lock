@@ -871,6 +871,7 @@ dependencies = [
 [[package]]
 name = "marv-dialect"
 version = "0.1.0"
+source = "git+https://github.com/Lmx154/marv-dialect.git?rev=61915e658105a5bb88ff239c560cd923f66a56f7#61915e658105a5bb88ff239c560cd923f66a56f7"
 dependencies = [
  "bitflags 2.13.2",
  "mavlink-bindgen",
@@ -1606,6 +1607,7 @@ checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 [[package]]
 name = "usb-cdc"
 version = "0.1.0"
+source = "git+https://github.com/Lmx154/usb-cdc.git?rev=0002fe99a8d2dfed44917d44e26dbda6ee92427e#0002fe99a8d2dfed44917d44e26dbda6ee92427e"
 dependencies = [
  "defmt",
  "embassy-sync",

@@ -1,6 +1,6 @@
 [package]
 name = "mavlink-device-hil"
-description = "On-target demonstration program of the mavlink-device crate over usb-cdc. Run with tools/run.sh mavlink_demo; the ground station drives it (MARV-GCS tools/board_check.sh)."
+description = "On-target demonstration program of the mavlink-device crate over usb-cdc. Run with tools/run.sh mavlink_demo; the ground station drives it (tools/board_check.sh of https://github.com/Lmx154/MARV-GCS)."
 version = "0.1.0"
 edition = "2024"
 publish = false
@@ -11,7 +11,9 @@ name = "hil_common"
 
 [dependencies]
 mavlink-device = { path = "..", features = ["defmt"] }
-usb-cdc = { path = "../../usb-cdc", features = ["defmt"] }
+# The USB byte pipe, from its own GitHub repository, pinned to a commit (change `rev`, then
+# `cargo update -p usb-cdc`).
+usb-cdc = { git = "https://github.com/Lmx154/usb-cdc.git", rev = "0002fe99a8d2dfed44917d44e26dbda6ee92427e", features = ["defmt"] }
 
 embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread", "executor-interrupt", "defmt"] }
 embassy-time = { version = "0.5.1", features = ["defmt", "defmt-timestamp-uptime"] }

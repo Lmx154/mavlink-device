@@ -261,6 +261,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 [[package]]
 name = "marv-dialect"
 version = "0.1.0"
+source = "git+https://github.com/Lmx154/marv-dialect.git?rev=61915e658105a5bb88ff239c560cd923f66a56f7#61915e658105a5bb88ff239c560cd923f66a56f7"
 dependencies = [
  "bitflags 2.13.2",
  "mavlink-bindgen",

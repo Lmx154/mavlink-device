@@ -10,7 +10,12 @@ description = "MAVLink 2 device layer for a flight controller: sans-IO core (fra
 defmt = ["dep:defmt", "embedded-io-async/defmt"]
 
 [dependencies]
-marv-dialect = { path = "../marv-dialect" }
+# The message definitions, from their own GitHub repository, pinned to a commit.
+# To take a newer one: change `rev` here and under [dev-dependencies], then `cargo update -p marv-dialect`
+# (here and in hil/). To work on both together, override it locally without editing the dependency:
+#   [patch."https://github.com/Lmx154/marv-dialect.git"]
+#   marv-dialect = { path = "../marv-dialect" }
+marv-dialect = { git = "https://github.com/Lmx154/marv-dialect.git", rev = "61915e658105a5bb88ff239c560cd923f66a56f7" }
 embedded-io-async = "0.7"
 embedded-hal-async = "1.0"
 defmt = { version = "1.0.1", optional = true }
@@ -21,4 +26,4 @@ exclude = ["hil"]
 [dev-dependencies]
 mavlink = { version = "=0.21.0", default-features = false, features = ["std", "serde", "dialect-common", "mav2-message-extensions"] }
 proptest = "1.12"
-marv-dialect = { path = "../marv-dialect", features = ["std"] }
+marv-dialect = { git = "https://github.com/Lmx154/marv-dialect.git", rev = "61915e658105a5bb88ff239c560cd923f66a56f7", features = ["std"] }
