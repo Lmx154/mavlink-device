@@ -1,6 +1,13 @@
 //! What the telemetry hook pushes, and the hook itself.
 
+use crate::node::Stats;
+use marv_dialect::common::{MavSeverity, MavState};
 use marv_dialect::{MAVLinkV2MessageRaw, MavHeader, MessageData};
+
+/// Texts that can wait to be sent.
+pub(crate) const TEXT_QUEUE: usize = 4;
+/// Bytes of a STATUSTEXT text.
+pub(crate) const TEXT_LEN: usize = 50;
 
 /// Frames one [`Telemetry::sample`] call may push.
 pub const MAX_BATCH: usize = 4;
@@ -115,10 +122,119 @@ impl Outgoing<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct Text {
+    pub(crate) severity: MavSeverity,
+    pub(crate) len: usize,
+    pub(crate) bytes: [u8; TEXT_LEN],
+}
+
+/// The queue of STATUSTEXTs waiting to be sent.
+pub(crate) struct TextQueue {
+    items: [Option<Text>; TEXT_QUEUE],
+    head: usize,
+    count: usize,
+}
+
+impl TextQueue {
+    pub(crate) const fn new() -> Self {
+        Self {
+            items: [None; TEXT_QUEUE],
+            head: 0,
+            count: 0,
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        *self = Self::new();
+    }
+
+    pub(crate) const fn len(&self) -> usize {
+        self.count
+    }
+
+    pub(crate) fn has_room(&self) -> bool {
+        self.count < TEXT_QUEUE
+    }
+
+    pub(crate) fn push(
+        &mut self,
+        stats: &mut Stats,
+        severity: MavSeverity,
+        text: &str,
+    ) -> Result<(), Full> {
+        if !self.has_room() {
+            stats.texts_dropped = stats.texts_dropped.saturating_add(1);
+            return Err(Full);
+        }
+        let mut cut = text.len().min(TEXT_LEN);
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let mut bytes = [0u8; TEXT_LEN];
+        for (dst, src) in bytes
+            .iter_mut()
+            .zip(text.as_bytes().get(..cut).unwrap_or(&[]))
+        {
+            *dst = *src;
+        }
+        let tail = (self.head + self.count) % TEXT_QUEUE;
+        let slot = self.items.get_mut(tail).ok_or(Full)?;
+        *slot = Some(Text {
+            severity,
+            len: cut,
+            bytes,
+        });
+        self.count += 1;
+        Ok(())
+    }
+
+    pub(crate) fn pop(&mut self) -> Option<Text> {
+        if self.count == 0 {
+            return None;
+        }
+        let text = self.items.get_mut(self.head)?.take();
+        self.head = (self.head + 1) % TEXT_QUEUE;
+        self.count -= 1;
+        text.filter(|t| t.len <= TEXT_LEN)
+    }
+}
+
+/// Where [`Telemetry::texts`] puts its STATUSTEXTs: the same queue as
+/// [`Node::queue_text`](crate::Node::queue_text).
+pub struct Texts<'a> {
+    pub(crate) queue: &'a mut TextQueue,
+    pub(crate) stats: &'a mut Stats,
+}
+
+impl Texts<'_> {
+    /// Queues a STATUSTEXT under the rules of [`Node::queue_text`](crate::Node::queue_text): at
+    /// most 4 wait, text beyond 50 bytes is cut on a character boundary. A `push` that does not
+    /// fit returns [`Full`] and is counted in [`Stats::texts_dropped`](crate::Stats).
+    pub fn push(&mut self, severity: MavSeverity, text: &str) -> Result<(), Full> {
+        self.queue.push(self.stats, severity, text)
+    }
+}
+
 /// The firmware's sensor hook. Values are sampled when due and never queued.
 pub trait Telemetry {
     /// Called once per period of the stream with this `message_id`. Push the frames to send with
     /// [`Outgoing::push`] (for example four HIGHRES_IMU instances) and return `true`. Return `false`,
     /// or push nothing, to send nothing this period; the period is used up either way.
     fn sample(&mut self, message_id: u32, now_us: u64, out: &mut Outgoing<'_>) -> bool;
+
+    /// Called once, right before each HEARTBEAT is built. `Some(state)` becomes the node's status
+    /// from then on, exactly as [`Node::set_status`](crate::Node::set_status) would; `None` leaves
+    /// it as it is. The default is `None`.
+    fn status(&mut self, now_us: u64) -> Option<MavState> {
+        let _ = now_us;
+        None
+    }
+
+    /// Called at most once per [`Node::poll_transmit`](crate::Node::poll_transmit), when no
+    /// HEARTBEAT is due and no reply waits, and only while the text queue has room. Queue texts
+    /// with [`Texts::push`]. The default pushes nothing.
+    fn texts(&mut self, now_us: u64, out: &mut Texts<'_>) {
+        let _ = (now_us, out);
+    }
 }

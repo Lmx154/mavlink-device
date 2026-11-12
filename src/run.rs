@@ -11,6 +11,8 @@ use embedded_io_async::{Read, Write};
 
 /// Bytes read from the link at a time.
 const READ_BUF: usize = 64;
+/// Longest sleep of `run`: the telemetry hooks are polled at least this often.
+const MAX_WAIT_US: u64 = 100_000;
 
 /// Why [`Node::run`] returned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,6 +36,10 @@ impl Node<'_> {
     /// with `write_all`, so never interleaved), then waits for the first of bytes from `rx` (given to
     /// [`receive`](Self::receive)) and the time of [`next_deadline_us`](Self::next_deadline_us)
     /// (through `delay`). It returns only on a read error, a write error or a read of 0 bytes.
+    ///
+    /// While it is awaited the node cannot be touched: the firmware changes the reported status and
+    /// sends texts through [`Telemetry::status`] and [`Telemetry::texts`]. It wakes at least every
+    /// 100 ms so that a text offered by the hook goes out within about that time when idle.
     ///
     /// `rx.read` must be cancel-safe: when the timer wins, the read future is dropped, and bytes it
     /// had taken must not be lost. `now_us` must be non-decreasing and on the same clock as `delay`.
@@ -59,7 +65,7 @@ impl Node<'_> {
                     return RunError::Write(e);
                 }
             }
-            let wait_us = self.next_deadline_us().saturating_sub(now_us()).max(1);
+            let wait_us = (self.next_deadline_us().saturating_sub(now_us())).clamp(1, MAX_WAIT_US);
             let wait_us = u32::try_from(wait_us).unwrap_or(u32::MAX);
             let woke = {
                 let mut read = pin!(rx.read(&mut buf));

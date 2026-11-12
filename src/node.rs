@@ -2,7 +2,7 @@
 
 use crate::config::{Config, StreamSlot};
 use crate::deframer::{Deframer, Frame, Kind};
-use crate::out::{Batch, FRAME_BUF, Full, Outgoing, Telemetry};
+use crate::out::{Batch, FRAME_BUF, Full, Outgoing, Telemetry, Text, TextQueue, Texts};
 use crate::params::ParamStore;
 use marv_dialect::common::{
     COMMAND_LONG_DATA, HEARTBEAT_DATA, MavModeFlag, MavSeverity, MavState, PARAM_REQUEST_LIST_DATA,
@@ -17,10 +17,6 @@ use service::{Incoming, List, REPLIES, Reply};
 
 /// Heartbeat period, not changeable.
 const HEARTBEAT_PERIOD_US: u64 = 1_000_000;
-/// Texts that can wait to be sent.
-const TEXT_QUEUE: usize = 4;
-/// Bytes of a STATUSTEXT text.
-const TEXT_LEN: usize = 50;
 
 /// The system and component that sent a HEARTBEAT.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,13 +67,6 @@ pub struct Stats {
     pub last_gcs: Option<Peer>,
 }
 
-#[derive(Clone, Copy)]
-struct Text {
-    severity: MavSeverity,
-    len: usize,
-    bytes: [u8; TEXT_LEN],
-}
-
 /// The sans-IO core of the device layer.
 ///
 /// Feed it received bytes with [`receive`](Self::receive), ask it for frames with
@@ -92,9 +81,7 @@ pub struct Node<'a> {
     status: MavState,
     heartbeat_due_us: Option<u64>,
     gcs_seen_us: Option<u64>,
-    texts: [Option<Text>; TEXT_QUEUE],
-    text_head: usize,
-    text_count: usize,
+    texts: TextQueue,
     batch: Batch,
     replies: [Option<Reply>; REPLIES],
     reply_count: usize,
@@ -116,9 +103,7 @@ impl<'a> Node<'a> {
             status: MavState::MAV_STATE_BOOT,
             heartbeat_due_us: None,
             gcs_seen_us: None,
-            texts: [None; TEXT_QUEUE],
-            text_head: 0,
-            text_count: 0,
+            texts: TextQueue::new(),
             batch: Batch::new(),
             replies: [None; REPLIES],
             reply_count: 0,
@@ -172,10 +157,22 @@ impl<'a> Node<'a> {
                         .saturating_mul(now_us.saturating_sub(d) / HEARTBEAT_PERIOD_US + 1),
                 ),
             });
+            if let Some(status) = tel.status(now_us) {
+                self.status = status;
+            }
             return self.emit_heartbeat(frame);
         }
         if let Some(n) = self.poll_reply(now_us, params, tel, frame) {
             return Some(n);
+        }
+        if self.texts.has_room() {
+            tel.texts(
+                now_us,
+                &mut Texts {
+                    queue: &mut self.texts,
+                    stats: &mut self.stats,
+                },
+            );
         }
         if let Some(text) = self.pop_text() {
             let statustext = STATUSTEXT_DATA {
@@ -209,7 +206,7 @@ impl<'a> Node<'a> {
     /// zero while replies, texts or pushed frames wait, else the next heartbeat, list item or stream.
     /// A value not after the current time means: poll now. An idle task can sleep until it.
     pub fn next_deadline_us(&self) -> u64 {
-        if self.text_count > 0 || self.batch.is_pending() || self.reply_count > 0 {
+        if self.texts.len() > 0 || self.batch.is_pending() || self.reply_count > 0 {
             return 0;
         }
         let heartbeat = self.heartbeat_due_us.unwrap_or(0);
@@ -228,9 +225,7 @@ impl<'a> Node<'a> {
         for slot in self.streams.iter_mut() {
             slot.reset();
         }
-        self.texts = [None; TEXT_QUEUE];
-        self.text_head = 0;
-        self.text_count = 0;
+        self.texts.clear();
         self.batch.clear();
         self.replies = [None; REPLIES];
         self.reply_count = 0;
@@ -239,41 +234,16 @@ impl<'a> Node<'a> {
         self.gcs_seen_us = None;
     }
 
-    /// Sets the `system_status` of the next HEARTBEAT.
+    /// Sets the `system_status` of the next HEARTBEAT. The latest status given, by this or by
+    /// [`Telemetry::status`], wins.
     pub fn set_status(&mut self, status: MavState) {
         self.status = status;
     }
 
-    /// Queues a STATUSTEXT; at most 4 wait. Text beyond 50 bytes is cut, on a character boundary.
+    /// Queues a STATUSTEXT; at most 4 wait, shared with [`Telemetry::texts`]. Text beyond 50 bytes is cut, on a character boundary.
     /// A full queue returns [`Full`] and is counted in [`Stats::texts_dropped`].
     pub fn queue_text(&mut self, severity: MavSeverity, text: &str) -> Result<(), Full> {
-        if self.text_count >= TEXT_QUEUE {
-            self.stats.texts_dropped = self.stats.texts_dropped.saturating_add(1);
-            return Err(Full);
-        }
-        let mut cut = text.len().min(TEXT_LEN);
-        while !text.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        let mut bytes = [0u8; TEXT_LEN];
-        for (dst, src) in bytes
-            .iter_mut()
-            .zip(text.as_bytes().get(..cut).unwrap_or(&[]))
-        {
-            *dst = *src;
-        }
-        let tail = (self.text_head + self.text_count) % TEXT_QUEUE;
-        if let Some(slot) = self.texts.get_mut(tail) {
-            *slot = Some(Text {
-                severity,
-                len: cut,
-                bytes,
-            });
-            self.text_count += 1;
-            Ok(())
-        } else {
-            Err(Full)
-        }
+        self.texts.push(&mut self.stats, severity, text)
     }
 
     /// Whether a ground-station HEARTBEAT arrived less than `gcs_timeout_us` before `now_us`. The
@@ -299,13 +269,7 @@ impl<'a> Node<'a> {
     }
 
     fn pop_text(&mut self) -> Option<Text> {
-        if self.text_count == 0 {
-            return None;
-        }
-        let text = self.texts.get_mut(self.text_head)?.take();
-        self.text_head = (self.text_head + 1) % TEXT_QUEUE;
-        self.text_count -= 1;
-        text.filter(|t| t.len <= TEXT_LEN)
+        self.texts.pop()
     }
 
     fn emit_heartbeat(&mut self, frame: &mut [u8; FRAME_BUF]) -> Option<usize> {

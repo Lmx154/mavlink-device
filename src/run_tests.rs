@@ -177,7 +177,7 @@ impl Rig {
         &mut self,
         node: &mut Node<'_>,
         mem: &mut Mem,
-        tel: &mut Fake,
+        tel: &mut impl Telemetry,
         until_us: u64,
     ) -> Option<RunError<IoErr, IoErr>> {
         let clock = self.clock.clone();
@@ -386,4 +386,242 @@ fn no_frame_is_ever_written_partially_even_when_the_writer_takes_a_few_bytes_per
         .map(|w| w.1[4])
         .collect();
     assert!(seqs.windows(2).all(|w| w[1] == w[0].wrapping_add(1)));
+}
+
+/// A telemetry object that drives status and texts through the hooks.
+#[derive(Default)]
+struct Hooks {
+    /// BOOT before this time, STANDBY from then on; `None` answers nothing.
+    standby_at_us: Option<u64>,
+    /// Texts to offer, each once, when the clock reaches the time.
+    texts: Vec<(u64, &'static str)>,
+    pushed: Vec<Result<(), Full>>,
+    status_calls: Vec<u64>,
+    text_calls: Vec<u64>,
+}
+
+impl Telemetry for Hooks {
+    fn sample(&mut self, message_id: u32, _now_us: u64, out: &mut Outgoing<'_>) -> bool {
+        message_id == 29 && out.push(&dialect::SCALED_PRESSURE_DATA::default()).is_ok()
+    }
+
+    fn status(&mut self, now_us: u64) -> Option<dialect::MavState> {
+        self.status_calls.push(now_us);
+        self.standby_at_us.map(|t| {
+            if now_us < t {
+                dialect::MavState::MAV_STATE_BOOT
+            } else {
+                dialect::MavState::MAV_STATE_STANDBY
+            }
+        })
+    }
+
+    fn texts(&mut self, now_us: u64, out: &mut Texts<'_>) {
+        self.text_calls.push(now_us);
+        while let Some(i) = self.texts.iter().position(|(t, _)| *t <= now_us) {
+            let (_, text) = self.texts.remove(i);
+            self.pushed
+                .push(out.push(dialect::MavSeverity::MAV_SEVERITY_INFO, text));
+        }
+    }
+}
+
+fn state_of(m: &Std) -> u32 {
+    match m {
+        Std::HEARTBEAT(h) => h.system_status as u32,
+        other => panic!("not a heartbeat: {other:?}"),
+    }
+}
+
+fn text_of(m: &Std) -> String {
+    match m {
+        Std::STATUSTEXT(t) => t.text.to_str().unwrap().to_string(),
+        other => panic!("not a STATUSTEXT: {other:?}"),
+    }
+}
+
+#[test]
+fn run_status_hook_gives_boot_then_standby_without_interrupting_run() {
+    let mut rig = Rig::new(vec![]);
+    let mut slots = [];
+    let mut n = node(&mut slots);
+    let mut mem = Mem::new(&[]);
+    let mut tel = Hooks {
+        standby_at_us: Some(1_000_000),
+        ..Hooks::default()
+    };
+    assert_eq!(rig.drive(&mut n, &mut mem, &mut tel, 3_500_000), None);
+    let states: Vec<(u64, u32)> = rig
+        .frames()
+        .iter()
+        .map(|(t, m)| (*t, state_of(m)))
+        .collect();
+    let boot = dialect::MavState::MAV_STATE_BOOT as u32;
+    let standby = dialect::MavState::MAV_STATE_STANDBY as u32;
+    assert_eq!(
+        states,
+        vec![
+            (0, boot),
+            (1_000_000, standby),
+            (2_000_000, standby),
+            (3_000_000, standby)
+        ]
+    );
+    assert_eq!(tel.status_calls, vec![0, 1_000_000, 2_000_000, 3_000_000]);
+}
+
+#[test]
+fn run_text_from_the_hook_goes_out_within_the_wake_period_when_idle() {
+    let mut rig = Rig::new(vec![]);
+    let mut slots = [];
+    let mut n = node(&mut slots);
+    let mut mem = Mem::new(&[]);
+    let mut tel = Hooks {
+        texts: vec![(450_000, "armed check ok")],
+        ..Hooks::default()
+    };
+    assert_eq!(rig.drive(&mut n, &mut mem, &mut tel, 900_000), None);
+    let f = rig.frames();
+    assert_eq!(f.len(), 2);
+    assert!(matches!(f[0].1, Std::HEARTBEAT(_)));
+    assert_eq!(text_of(&f[1].1), "armed check ok");
+    assert!(
+        (450_000..=550_000).contains(&f[1].0),
+        "sent at {} us",
+        f[1].0
+    );
+    assert_eq!(n.stats().texts_dropped, 0);
+}
+
+#[test]
+fn run_text_from_the_hook_follows_heartbeat_and_replies_and_precedes_streams() {
+    let req = crate::tests::std_frame(255, 190, 0, &read_idx(1));
+    let mut rig = Rig::new(vec![(300_000, Ev::Bytes(req))]);
+    let mut slots = [slot(29, 300_000, 20_000)];
+    let mut n = node(&mut slots);
+    let mut mem = Mem::numbered(4);
+    let mut tel = Hooks {
+        texts: vec![(300_000, "after the reply"), (1_000_000, "after the beat")],
+        ..Hooks::default()
+    };
+    assert_eq!(rig.drive(&mut n, &mut mem, &mut tel, 1_050_000), None);
+    let f = rig.frames();
+    let at = |t: u64| -> Vec<&Std> { f.iter().filter(|x| x.0 == t).map(|x| &x.1).collect() };
+    let a = at(300_000);
+    assert!(matches!(a[0], Std::PARAM_VALUE(_)), "{:?}", a[0]);
+    assert_eq!(text_of(a[1]), "after the reply");
+    assert!(matches!(a[2], Std::SCALED_PRESSURE(_)), "{:?}", a[2]);
+    let b = at(1_000_000);
+    assert!(matches!(b[0], Std::HEARTBEAT(_)), "{:?}", b[0]);
+    assert_eq!(text_of(b[1]), "after the beat");
+}
+
+#[test]
+fn run_waking_every_100_ms_does_not_move_the_heartbeat_or_stream_schedule() {
+    let mut rig = Rig::new(vec![]);
+    let mut slots = [slot(29, 250_000, 20_000)];
+    let mut n = node(&mut slots);
+    let mut mem = Mem::new(&[]);
+    let mut tel = Hooks::default();
+    assert_eq!(rig.drive(&mut n, &mut mem, &mut tel, 2_050_000), None);
+    let f = rig.frames();
+    let times = |pred: fn(&Std) -> bool| -> Vec<u64> {
+        f.iter().filter(|x| pred(&x.1)).map(|x| x.0).collect()
+    };
+    assert_eq!(
+        times(|m| matches!(m, Std::HEARTBEAT(_))),
+        vec![0, 1_000_000, 2_000_000]
+    );
+    assert_eq!(
+        times(|m| matches!(m, Std::SCALED_PRESSURE(_))),
+        (0..=8).map(|k| k * 250_000).collect::<Vec<u64>>()
+    );
+}
+
+#[test]
+fn texts_hook_is_called_once_per_poll_and_only_with_room_and_full_is_counted() {
+    let mut slots = [];
+    let mut n = node(&mut slots);
+    let mem = Mem::new(&[]);
+    let mut frame = [0u8; 280];
+    let mut tel = Hooks::default();
+    assert!(n.poll_transmit(0, &mem, &mut tel, &mut frame).is_some());
+    assert!(tel.text_calls.is_empty(), "the heartbeat came first");
+    tel.texts = (0..5).map(|_| (0, "t")).collect();
+    assert!(n.poll_transmit(0, &mem, &mut tel, &mut frame).is_some());
+    assert_eq!(tel.text_calls, vec![0]);
+    assert_eq!(tel.pushed, vec![Ok(()), Ok(()), Ok(()), Ok(()), Err(Full)]);
+    assert_eq!(n.stats().texts_dropped, 1);
+    // Three texts still wait; one slot is free, so the hook is asked again, once per poll.
+    assert!(n.poll_transmit(0, &mem, &mut tel, &mut frame).is_some());
+    assert_eq!(tel.text_calls, vec![0, 0]);
+    // Two wait now; fill the queue to four: the hook is not asked.
+    for _ in 0..2 {
+        n.queue_text(dialect::MavSeverity::MAV_SEVERITY_INFO, "x")
+            .unwrap();
+    }
+    assert!(n.poll_transmit(0, &mem, &mut tel, &mut frame).is_some());
+    assert_eq!(tel.text_calls, vec![0, 0], "the queue was full: no call");
+}
+
+#[test]
+fn hook_texts_are_cut_like_queue_text_and_share_the_queue_with_it() {
+    let mut slots = [];
+    let mut n = node(&mut slots);
+    let mem = Mem::new(&[]);
+    let mut frame = [0u8; 280];
+    let mut tel = Hooks::default();
+    assert!(n.poll_transmit(0, &mem, &mut tel, &mut frame).is_some());
+    n.queue_text(dialect::MavSeverity::MAV_SEVERITY_INFO, "first")
+        .unwrap();
+    // 49 ASCII bytes then a two-byte character: cut before it.
+    let long = format!("{}é", "a".repeat(49));
+    let long: &'static str = Box::leak(long.into_boxed_str());
+    tel.texts = vec![(0, long), (0, "third")];
+    let mut got = Vec::new();
+    while let Some(len) = n.poll_transmit(0, &mem, &mut tel, &mut frame) {
+        got.push(text_of(&decode(&frame[..len]).1));
+    }
+    assert_eq!(
+        got,
+        vec!["first".to_string(), "a".repeat(49), "third".to_string()]
+    );
+}
+
+#[test]
+fn latest_status_wins_between_set_status_and_the_hook() {
+    let mut slots = [];
+    let mut n = node(&mut slots);
+    let mem = Mem::new(&[]);
+    let mut frame = [0u8; 280];
+    let active = dialect::MavState::MAV_STATE_ACTIVE;
+    let standby = dialect::MavState::MAV_STATE_STANDBY;
+    let mut silent = Hooks::default();
+    let len = n.poll_transmit(0, &mem, &mut silent, &mut frame).unwrap();
+    assert_eq!(
+        state_of(&decode(&frame[..len]).1),
+        dialect::MavState::MAV_STATE_BOOT as u32
+    );
+    // set_status, hook says nothing: the set status stays.
+    n.set_status(active);
+    let len = n
+        .poll_transmit(1_000_000, &mem, &mut silent, &mut frame)
+        .unwrap();
+    assert_eq!(state_of(&decode(&frame[..len]).1), active as u32);
+    // The hook answers: it wins over the earlier set_status.
+    let mut hook = Hooks {
+        standby_at_us: Some(0),
+        ..Hooks::default()
+    };
+    let len = n
+        .poll_transmit(2_000_000, &mem, &mut hook, &mut frame)
+        .unwrap();
+    assert_eq!(state_of(&decode(&frame[..len]).1), standby as u32);
+    // set_status after the hook wins, since the hook is only asked at the next heartbeat and
+    // answers None here.
+    n.set_status(active);
+    let len = n
+        .poll_transmit(3_000_000, &mem, &mut silent, &mut frame)
+        .unwrap();
+    assert_eq!(state_of(&decode(&frame[..len]).1), active as u32);
 }

@@ -78,6 +78,6 @@ pub use marv_dialect::common as dialect;
 
 pub use config::{Config, Stream, StreamSlot, VersionInfo};
 pub use node::{Node, Peer, Stats};
-pub use out::{FRAME_BUF, Full, MAX_BATCH, Outgoing, Telemetry};
+pub use out::{FRAME_BUF, Full, MAX_BATCH, Outgoing, Telemetry, Texts};
 pub use params::{ParamError, ParamName, ParamStore, ParamValue};
 pub use run::RunError;
