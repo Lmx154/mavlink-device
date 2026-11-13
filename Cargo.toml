@@ -13,6 +13,8 @@ rust-version = "1.99"
 
 [features]
 defmt = ["dep:defmt", "embedded-io-async/defmt"]
+# Test-only hooks for the host tests and the on-board negative controls; not part of the API.
+_test-hooks = []
 
 [dependencies]
 # The message definitions, from their own GitHub repository, pinned to a commit.

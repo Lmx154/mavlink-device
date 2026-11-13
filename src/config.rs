@@ -1,5 +1,6 @@
 //! Node configuration and the stream table.
 
+use crate::accept::{AcceptList, AcceptListFull};
 use marv_dialect::common::{MavAutopilot, MavType};
 
 /// Static configuration of a [`Node`](crate::Node).
@@ -23,6 +24,9 @@ pub struct Config {
     pub param_list_interval_us: u32,
     /// What AUTOPILOT_VERSION reports.
     pub version: VersionInfo,
+    /// The messages handed to the application by [`Node::receive_with`](crate::Node::receive_with);
+    /// empty by default.
+    pub accept: AcceptList,
 }
 
 /// The version numbers, identity and unique id that AUTOPILOT_VERSION reports. All zero by default.
@@ -114,6 +118,7 @@ impl Config {
             gcs_timeout_us: 5_000_000,
             param_list_interval_us: 2_000,
             version: VersionInfo::new(),
+            accept: AcceptList::new(),
         }
     }
 
@@ -145,6 +150,18 @@ impl Config {
     pub const fn with_version(mut self, version: VersionInfo) -> Self {
         self.version = version;
         self
+    }
+
+    /// Sets the accept list: (message id, CRC_EXTRA) pairs, normally `(M::ID, M::EXTRA_CRC)` of
+    /// `marv-dialect` message types. At most 16; more is an error and nothing is truncated.
+    pub const fn with_accept_list(mut self, pairs: &[(u32, u8)]) -> Result<Self, AcceptListFull> {
+        match AcceptList::from_pairs(pairs) {
+            Ok(list) => {
+                self.accept = list;
+                Ok(self)
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -213,11 +230,12 @@ impl StreamSlot {
     }
 
     /// Moves the schedule past `now_us`: the next period on the grid of the first one, so missed
-    /// periods are skipped and the rate does not drift.
-    pub(crate) fn advance(&mut self, now_us: u64) {
+    /// periods are skipped and the rate does not drift. `slowdown_us` is added to the period.
+    pub(crate) fn advance(&mut self, now_us: u64, slowdown_us: u64) {
         let Some(period) = self.period_us() else {
             return;
         };
+        let period = period.saturating_add(slowdown_us);
         self.due_us = Some(match self.due_us {
             None => now_us.saturating_add(period),
             Some(d) => {

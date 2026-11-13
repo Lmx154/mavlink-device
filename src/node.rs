@@ -1,12 +1,13 @@
 //! The sans-IO node: bytes and time in, frames out.
 
+use crate::accept::Incoming as Handover;
 use crate::config::{Config, StreamSlot};
 use crate::deframer::{Deframer, Frame, Kind};
 use crate::out::{Batch, FRAME_BUF, Full, Outgoing, Telemetry, Text, TextQueue, Texts};
 use crate::params::ParamStore;
 use marv_dialect::common::{
     COMMAND_LONG_DATA, HEARTBEAT_DATA, MavModeFlag, MavSeverity, MavState, PARAM_REQUEST_LIST_DATA,
-    PARAM_REQUEST_READ_DATA, PARAM_SET_DATA, STATUSTEXT_DATA,
+    PARAM_REQUEST_READ_DATA, PARAM_SET_DATA, RADIO_STATUS_DATA, STATUSTEXT_DATA,
 };
 use marv_dialect::types::CharArray;
 use marv_dialect::{MAVLinkV2MessageRaw, MavHeader, MavlinkVersion, MessageData, calculate_crc};
@@ -17,6 +18,26 @@ use service::{Incoming, List, REPLIES, Reply};
 
 /// Heartbeat period, not changeable.
 const HEARTBEAT_PERIOD_US: u64 = 1_000_000;
+
+/// Slowdown bounds and steps of the RADIO_STATUS flow control, in milliseconds: ArduPilot's
+/// `GCS_MAVLINK::handle_radio_status`.
+const SLOWDOWN_CEILING_MS: u32 = 2000;
+const SLOWDOWN_FLOOR_FAST_MS: u32 = 200;
+
+/// The stream slowdown after a RADIO_STATUS with `txbuf` percent free, from the slowdown before.
+pub(crate) fn next_slowdown_ms(slowdown_ms: u32, txbuf: u8) -> u32 {
+    if txbuf < 20 && slowdown_ms < SLOWDOWN_CEILING_MS {
+        slowdown_ms.saturating_add(60)
+    } else if txbuf < 50 && slowdown_ms < SLOWDOWN_CEILING_MS {
+        slowdown_ms.saturating_add(20)
+    } else if txbuf > 95 && slowdown_ms > SLOWDOWN_FLOOR_FAST_MS {
+        slowdown_ms.saturating_sub(40)
+    } else if txbuf > 90 && slowdown_ms != 0 {
+        slowdown_ms.saturating_sub(20)
+    } else {
+        slowdown_ms
+    }
+}
 
 /// The system and component that sent a HEARTBEAT.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +70,9 @@ pub struct Stats {
     /// Valid frames whose payload did not decode dropped (a COMMAND_LONG whose command number the
     /// dialect does not know, or a PARAM_SET with an unknown `param_type`, included).
     pub dropped_malformed: u32,
+    /// Frames of a message on the accept list with a wrong checksum (computed with the listed
+    /// CRC_EXTRA) dropped, false starts that grew into a candidate frame included.
+    pub dropped_listed_checksum: u32,
     /// Valid HEARTBEATs received, from any sender.
     pub heartbeats_received: u32,
     /// PARAM_REQUEST_LIST, PARAM_REQUEST_READ, PARAM_SET and COMMAND_LONG frames dropped because
@@ -87,6 +111,9 @@ pub struct Node<'a> {
     reply_count: usize,
     list: Option<List>,
     stats: Stats,
+    slowdown_ms: u32,
+    #[cfg(feature = "_test-hooks")]
+    slowdown_off: bool,
 }
 
 impl<'a> Node<'a> {
@@ -109,14 +136,37 @@ impl<'a> Node<'a> {
             reply_count: 0,
             list: None,
             stats: Stats::default(),
+            slowdown_ms: 0,
+            #[cfg(feature = "_test-hooks")]
+            slowdown_off: false,
         }
     }
 
     /// Takes bytes from the link, in any split. Garbage and frames the node does not accept are
     /// dropped and counted in [`Stats`]. Parameter requests and commands are acted on here (a write
     /// calls [`ParamStore::set`]) and their replies are queued for
-    /// [`poll_transmit`](Self::poll_transmit).
+    /// [`poll_transmit`](Self::poll_transmit). Messages of the accept list are dropped here; use
+    /// [`receive_with`](Self::receive_with) to get them.
     pub fn receive(&mut self, bytes: &[u8], now_us: u64, params: &mut impl ParamStore) {
+        self.receive_with(bytes, now_us, params, &mut |_| {});
+    }
+
+    /// As [`receive`](Self::receive), and every frame of a message on the accept list
+    /// ([`Config::with_accept_list`]) is handed to `on_message`, once, from inside this call, when it is
+    /// MAVLink 2 with incompatibility flags 0, its checksum is right for the listed CRC_EXTRA and
+    /// its system id is not the node's own. The node does not interpret, queue or target-filter
+    /// those messages. RADIO_STATUS is handled by the node whoever sends it (it drives the stream
+    /// slowdown, see [`stream_slowdown_ms`](Self::stream_slowdown_ms)) and is also handed over when
+    /// it is listed. `on_message` must not block; the [`crate::Incoming`] borrows the receive
+    /// buffer and must not be kept. Entries of the list for other ids the node handles itself
+    /// (HEARTBEAT, the parameter messages, COMMAND_LONG) have no effect.
+    pub fn receive_with(
+        &mut self,
+        bytes: &[u8],
+        now_us: u64,
+        params: &mut impl ParamStore,
+        on_message: &mut dyn FnMut(Handover<'_>),
+    ) {
         let mut rest = bytes;
         while !rest.is_empty() {
             let taken = self.rx.feed(rest);
@@ -125,7 +175,18 @@ impl<'a> Node<'a> {
                 continue;
             }
             rest = rest.get(taken..).unwrap_or(&[]);
-            while let Some(frame) = self.rx.next_frame(&mut self.stats) {
+            while let Some(frame) = self.rx.next_frame(&mut self.stats, &self.config.accept) {
+                if matches!(frame.kind, Kind::RadioStatus | Kind::Listed) {
+                    hand_over(
+                        &mut self.stats,
+                        &mut self.slowdown_ms,
+                        &self.config,
+                        &frame,
+                        now_us,
+                        on_message,
+                    );
+                    continue;
+                }
                 let sender = Peer {
                     system_id: frame.system_id,
                     component_id: frame.component_id,
@@ -189,10 +250,11 @@ impl<'a> Node<'a> {
         if let Some(n) = self.send_batch_frame(frame) {
             return Some(n);
         }
+        let slowdown_us = self.slowdown_us();
         loop {
             let slot = self.streams.iter_mut().find(|s| s.is_due(now_us))?;
             let message_id = slot.stream().message_id;
-            slot.advance(now_us);
+            slot.advance(now_us, slowdown_us);
             if !sample_into(&mut self.batch, &self.config, tel, message_id, now_us) {
                 continue;
             }
@@ -232,6 +294,7 @@ impl<'a> Node<'a> {
         self.list = None;
         self.rx.clear();
         self.gcs_seen_us = None;
+        self.slowdown_ms = 0;
     }
 
     /// Sets the `system_status` of the next HEARTBEAT. The latest status given, by this or by
@@ -256,6 +319,35 @@ impl<'a> Node<'a> {
     /// The counters.
     pub fn stats(&self) -> &Stats {
         &self.stats
+    }
+
+    /// The stream slowdown in milliseconds: it is added to the interval of every stream each time
+    /// the stream is rescheduled (HEARTBEAT excepted). It starts at 0, follows the `txbuf` of the
+    /// RADIO_STATUS messages received (see the README) and is reset to 0 by
+    /// [`on_link_down`](Self::on_link_down). It stays 0 on a link that never carries RADIO_STATUS.
+    pub fn stream_slowdown_ms(&self) -> u32 {
+        self.slowdown_ms
+    }
+
+    /// Test hook (feature `_test-hooks`): with `off` the slowdown is still tracked and reported but
+    /// no longer added to the stream intervals.
+    #[cfg(feature = "_test-hooks")]
+    pub fn set_slowdown_off(&mut self, off: bool) {
+        self.slowdown_off = off;
+    }
+
+    #[cfg(feature = "_test-hooks")]
+    fn slowdown_us(&self) -> u64 {
+        if self.slowdown_off {
+            0
+        } else {
+            u64::from(self.slowdown_ms) * 1000
+        }
+    }
+
+    #[cfg(not(feature = "_test-hooks"))]
+    fn slowdown_us(&self) -> u64 {
+        u64::from(self.slowdown_ms) * 1000
     }
 
     #[cfg(test)]
@@ -321,6 +413,41 @@ impl<'a> Node<'a> {
     }
 }
 
+/// A frame of RADIO_STATUS or of a listed message: the slowdown for the first, the hook for either
+/// when listed.
+fn hand_over(
+    stats: &mut Stats,
+    slowdown_ms: &mut u32,
+    config: &Config,
+    frame: &Frame<'_>,
+    now_us: u64,
+    on_message: &mut dyn FnMut(Handover<'_>),
+) {
+    if frame.system_id == config.system_id {
+        stats.dropped_own_system = stats.dropped_own_system.saturating_add(1);
+        return;
+    }
+    if frame.kind == Kind::RadioStatus {
+        match RADIO_STATUS_DATA::deser(MavlinkVersion::V2, frame.payload) {
+            Ok(status) => *slowdown_ms = next_slowdown_ms(*slowdown_ms, status.txbuf),
+            Err(_) => {
+                stats.dropped_malformed = stats.dropped_malformed.saturating_add(1);
+                return;
+            }
+        }
+        if config.accept.extra_crc(frame.message_id).is_none() {
+            return;
+        }
+    }
+    on_message(Handover {
+        system_id: frame.system_id,
+        component_id: frame.component_id,
+        message_id: frame.message_id,
+        payload: frame.payload,
+        now_us,
+    });
+}
+
 fn decode(stats: &mut Stats, own_system_id: u8, frame: &Frame<'_>) -> Option<Incoming> {
     if frame.system_id == own_system_id {
         stats.dropped_own_system = stats.dropped_own_system.saturating_add(1);
@@ -337,6 +464,7 @@ fn decode(stats: &mut Stats, own_system_id: u8, frame: &Frame<'_>) -> Option<Inc
         }
         Kind::ParamSet => PARAM_SET_DATA::deser(v, frame.payload).map(Incoming::ParamSet),
         Kind::CommandLong => COMMAND_LONG_DATA::deser(v, frame.payload).map(Incoming::CommandLong),
+        Kind::RadioStatus | Kind::Listed => return None,
     };
     if decoded.is_err() {
         stats.dropped_malformed = stats.dropped_malformed.saturating_add(1);

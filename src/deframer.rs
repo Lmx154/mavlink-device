@@ -1,9 +1,10 @@
 //! MAVLink 2 deframer with its own bounded buffer.
 
+use crate::accept::AcceptList;
 use crate::node::Stats;
 use marv_dialect::common::{
     COMMAND_LONG_DATA, HEARTBEAT_DATA, PARAM_REQUEST_LIST_DATA, PARAM_REQUEST_READ_DATA,
-    PARAM_SET_DATA,
+    PARAM_SET_DATA, RADIO_STATUS_DATA,
 };
 use marv_dialect::{MessageData, calculate_crc};
 
@@ -26,6 +27,9 @@ pub(crate) enum Kind {
     ParamRequestRead,
     ParamSet,
     CommandLong,
+    RadioStatus,
+    /// A message of the accept list that the node does not handle itself.
+    Listed,
 }
 
 fn classify(id: u32) -> Option<(Kind, u8)> {
@@ -39,6 +43,8 @@ fn classify(id: u32) -> Option<(Kind, u8)> {
         Some((Kind::ParamSet, PARAM_SET_DATA::EXTRA_CRC))
     } else if id == COMMAND_LONG_DATA::ID {
         Some((Kind::CommandLong, COMMAND_LONG_DATA::EXTRA_CRC))
+    } else if id == RADIO_STATUS_DATA::ID {
+        Some((Kind::RadioStatus, RADIO_STATUS_DATA::EXTRA_CRC))
     } else {
         None
     }
@@ -48,6 +54,7 @@ fn classify(id: u32) -> Option<(Kind, u8)> {
 pub(crate) struct Frame<'a> {
     pub system_id: u8,
     pub component_id: u8,
+    pub message_id: u32,
     pub kind: Kind,
     pub payload: &'a [u8],
 }
@@ -63,6 +70,7 @@ struct Found {
     total: usize,
     system_id: u8,
     component_id: u8,
+    message_id: u32,
     kind: Kind,
     payload_len: usize,
 }
@@ -112,20 +120,25 @@ impl Deframer {
 
     /// The next frame whole in the buffer, counting what it throws away. `None` when only part of
     /// a candidate is left (it is always shorter than the buffer).
-    pub(crate) fn next_frame(&mut self, stats: &mut Stats) -> Option<Frame<'_>> {
+    pub(crate) fn next_frame(
+        &mut self,
+        stats: &mut Stats,
+        accept: &AcceptList,
+    ) -> Option<Frame<'_>> {
         self.release();
-        let found = self.find(stats)?;
+        let found = self.find(stats, accept)?;
         self.consume = found.total;
         let payload = self.buf.get(HEADER_LEN..HEADER_LEN + found.payload_len)?;
         Some(Frame {
             system_id: found.system_id,
             component_id: found.component_id,
+            message_id: found.message_id,
             kind: found.kind,
             payload,
         })
     }
 
-    fn find(&mut self, stats: &mut Stats) -> Option<Found> {
+    fn find(&mut self, stats: &mut Stats, accept: &AcceptList) -> Option<Found> {
         loop {
             let live = self.buf.get(..self.len)?;
             let start = live
@@ -154,7 +167,11 @@ impl Deframer {
                 return None;
             };
             let id = u32::from_le_bytes([id0, id1, id2, 0]);
-            let Some((kind, extra_crc)) = classify(id) else {
+            let Some((kind, extra_crc)) = classify(id).or_else(|| {
+                accept
+                    .extra_crc(id)
+                    .map(|extra_crc| (Kind::Listed, extra_crc))
+            }) else {
                 stats.dropped_unknown_message = stats.dropped_unknown_message.saturating_add(1);
                 self.drop_front(1);
                 continue;
@@ -172,7 +189,11 @@ impl Deframer {
                 return None;
             };
             if calculate_crc(crc_input, extra_crc) != u16::from_le_bytes([c0, c1]) {
-                stats.dropped_checksum = stats.dropped_checksum.saturating_add(1);
+                if kind == Kind::Listed {
+                    stats.dropped_listed_checksum = stats.dropped_listed_checksum.saturating_add(1);
+                } else {
+                    stats.dropped_checksum = stats.dropped_checksum.saturating_add(1);
+                }
                 self.drop_front(1);
                 continue;
             }
@@ -180,6 +201,7 @@ impl Deframer {
                 total,
                 system_id: *live.get(5)?,
                 component_id: *live.get(6)?,
+                message_id: id,
                 kind,
                 payload_len,
             });
