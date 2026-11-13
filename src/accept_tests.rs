@@ -691,3 +691,77 @@ fn the_parameter_list_interval_is_set_per_node_through_config() {
     assert_eq!(c.param_list_interval_us, 40_000);
     assert_eq!(Config::new(1, 1).param_list_interval_us, 2_000);
 }
+
+// ---- reading the list back ----
+
+fn numbered(n: usize) -> Vec<(u32, u8)> {
+    (0..n)
+        .map(|i| (2000 + i as u32 * 3, 200 - i as u8))
+        .collect()
+}
+
+#[test]
+fn iter_returns_exactly_the_given_pairs_in_order() {
+    for n in [0, 1, 16] {
+        let pairs = numbered(n);
+        let list = AcceptList::from_pairs(&pairs).unwrap();
+        assert_eq!(list.iter().collect::<Vec<_>>(), pairs, "{n} entries");
+        assert_eq!(list.iter().count(), list.len());
+    }
+    // Order is the order given, not sorted; a repeated id is kept.
+    let pairs = [(9, 1), (3, 2), (9, 4)];
+    let list = AcceptList::from_pairs(&pairs).unwrap();
+    assert_eq!(list.iter().collect::<Vec<_>>(), pairs);
+    assert_eq!(AcceptList::new().iter().count(), 0);
+}
+
+#[test]
+fn contains_is_true_for_each_listed_id_and_false_for_another() {
+    let pairs = numbered(16);
+    let list = AcceptList::from_pairs(&pairs).unwrap();
+    for (id, _) in &pairs {
+        assert!(list.contains(*id));
+        assert!(!list.contains(*id + 1));
+    }
+    assert!(!list.contains(0));
+    assert!(!AcceptList::new().contains(0));
+    // Unused slots are zeroed internally: id 0 must not read as listed.
+    assert!(!AcceptList::from_pairs(&numbered(3)).unwrap().contains(0));
+}
+
+#[test]
+fn a_list_rebuilt_from_iter_plus_two_pairs_hands_over_all_of_them() {
+    let first = AcceptList::from_pairs(&[rc_pair(), (CUSTOM_ID, CUSTOM_EXTRA)]).unwrap();
+    let extra = [(CUSTOM_ID + 1, 5u8), (CUSTOM_ID + 2, 6u8)];
+    let mut pairs: Vec<(u32, u8)> = first.iter().collect();
+    pairs.extend(extra);
+    let rebuilt = AcceptList::from_pairs(&pairs).unwrap();
+    assert_eq!(rebuilt.len(), 4);
+    assert_eq!(rebuilt.iter().collect::<Vec<_>>(), pairs);
+
+    let mut cfg = Config::new(OWN, 1);
+    cfg.accept = rebuilt;
+    let mut slots = [];
+    let mut node = Node::new(cfg, &mut slots);
+    let mut stream = rc_override(255, 190, 1500, 1600);
+    stream.extend(custom(7, 9, &[1, 2, 3]));
+    stream.extend(raw(0xFD, 0, 7, 9, CUSTOM_ID + 1, &[4], 5));
+    stream.extend(raw(0xFD, 0, 7, 9, CUSTOM_ID + 2, &[5], 6));
+    let seen = one_shot(&mut node, &stream);
+    let ids: Vec<u32> = seen.iter().map(|s| s.2).collect();
+    assert_eq!(ids, [70, CUSTOM_ID, CUSTOM_ID + 1, CUSTOM_ID + 2]);
+    assert_eq!(node.stats().dropped_listed_checksum, 0);
+}
+
+#[test]
+fn rebuilding_beyond_16_gives_accept_list_full() {
+    let full = AcceptList::from_pairs(&numbered(16)).unwrap();
+    let mut pairs: Vec<(u32, u8)> = full.iter().collect();
+    pairs.extend([(1, 1), (2, 2)]);
+    assert_eq!(AcceptList::from_pairs(&pairs), Err(AcceptListFull));
+    // 14 plus two is exactly 16 and fits.
+    let fourteen = AcceptList::from_pairs(&numbered(14)).unwrap();
+    let mut pairs: Vec<(u32, u8)> = fourteen.iter().collect();
+    pairs.extend([(1, 1), (2, 2)]);
+    assert_eq!(AcceptList::from_pairs(&pairs).unwrap().len(), 16);
+}

@@ -60,6 +60,17 @@ impl AcceptList {
         self.len == 0
     }
 
+    /// The (message id, CRC_EXTRA) pairs, in the order they were given to
+    /// [`from_pairs`](Self::from_pairs).
+    pub fn iter(&self) -> impl Iterator<Item = (u32, u8)> + '_ {
+        self.entries.get(..self.len).unwrap_or(&[]).iter().copied()
+    }
+
+    /// Whether the list has an entry for `message_id`.
+    pub fn contains(&self, message_id: u32) -> bool {
+        self.extra_crc(message_id).is_some()
+    }
+
     /// The CRC_EXTRA listed for `message_id` (the first entry with that id), if any.
     pub(crate) fn extra_crc(&self, message_id: u32) -> Option<u8> {
         self.entries
