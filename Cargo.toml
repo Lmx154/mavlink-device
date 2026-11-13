@@ -5,6 +5,11 @@ edition = "2024"
 publish = false
 license = "MIT"
 description = "MAVLink 2 device layer for a flight controller: sans-IO core (framing, heartbeat, ground-station presence, stream scheduler, status text queue) over any byte stream."
+repository = "https://github.com/Lmx154/mavlink-device"
+readme = "README.md"
+keywords = ["embedded", "no-std", "mavlink", "drone", "uav"]
+categories = ["embedded", "no-std", "network-programming", "encoding"]
+rust-version = "1.99"
 
 [features]
 defmt = ["dep:defmt", "embedded-io-async/defmt"]

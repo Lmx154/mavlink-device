@@ -4,6 +4,10 @@ MAVLink 2 device layer for the MARV V2 flight controller. The crate is `no_std` 
 
 **Status: version 0.1.0 (`publish = false`). The API may still change.** Host tests pass and the crate has run on the MARV V2 Rev 1 board in a demonstration program against the ground station (results in "Measured on the MARV V2 Rev 1 board"; what is still open is in "Not covered and not verified"). The contract is [`docs/link-contract.md` of MARV-GCS](https://github.com/Lmx154/MARV-GCS/blob/main/docs/link-contract.md), sections 2 and 4.
 
+## Works with
+
+The crate works with any HAL and any MCU that provides `embedded-io-async` 0.7 streams and an `embedded-hal-async` 1.0 `DelayNs`; the messages come from `marv-dialect`. No embassy crate is needed.
+
 ## What is here
 
 - Framing out and in, at the message-struct level (`serialize_message_data`, `deser`, `calculate_crc`); no dialect enum, no `write_*` helper.
