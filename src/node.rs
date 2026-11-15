@@ -6,9 +6,10 @@ use crate::deframer::{Deframer, Frame, Kind};
 use crate::out::{Batch, FRAME_BUF, Full, Outgoing, Telemetry, Text, TextQueue, Texts};
 use crate::params::ParamStore;
 use marv_dialect::common::{
-    COMMAND_LONG_DATA, HEARTBEAT_DATA, MavModeFlag, MavSeverity, MavState, PARAM_REQUEST_LIST_DATA,
+    HEARTBEAT_DATA, MavModeFlag, MavSeverity, MavState, PARAM_REQUEST_LIST_DATA,
     PARAM_REQUEST_READ_DATA, PARAM_SET_DATA, RADIO_STATUS_DATA, STATUSTEXT_DATA,
 };
+use marv_dialect::marv::COMMAND_LONG_DATA;
 use marv_dialect::types::CharArray;
 use marv_dialect::{MAVLinkV2MessageRaw, MavHeader, MavlinkVersion, MessageData, calculate_crc};
 
@@ -67,8 +68,8 @@ pub struct Stats {
     pub dropped_unknown_message: u32,
     /// Valid frames carrying the node's own system id dropped.
     pub dropped_own_system: u32,
-    /// Valid frames whose payload did not decode dropped (a COMMAND_LONG whose command number the
-    /// dialect does not know, or a PARAM_SET with an unknown `param_type`, included).
+    /// Valid frames whose payload did not decode dropped (a COMMAND_LONG whose command number is in
+    /// neither `common` nor the project's dialect, or a PARAM_SET with an unknown `param_type`, included).
     pub dropped_malformed: u32,
     /// Frames of a message on the accept list with a wrong checksum (computed with the listed
     /// CRC_EXTRA) dropped, false starts that grew into a candidate frame included.
@@ -200,7 +201,9 @@ impl<'a> Node<'a> {
     }
 
     /// The next frame to send, whole, written to the start of `frame`; `Some(len)`, or `None` when
-    /// nothing is due. Priority: a due HEARTBEAT, replies (in order of arrival), queued texts, the
+    /// nothing is due. Priority: a due HEARTBEAT, replies (in order of arrival; the
+    /// [`Telemetry::command`] hook is called when its command's reply comes up), a later COMMAND_ACK
+    /// from [`Telemetry::acks`], queued texts, the
     /// next due item of a parameter list, the rest of the frames of the last sample, then due streams
     /// in slot order. Call it until it returns `None`.
     pub fn poll_transmit(
@@ -225,6 +228,9 @@ impl<'a> Node<'a> {
         }
         if let Some(n) = self.poll_reply(now_us, params, tel, frame) {
             return Some(n);
+        }
+        if let Some(late) = tel.acks(now_us) {
+            return self.emit_ack(late.command, late.outcome, late.target, frame);
         }
         if self.texts.has_room() {
             tel.texts(
@@ -334,6 +340,21 @@ impl<'a> Node<'a> {
     #[cfg(feature = "_test-hooks")]
     pub fn set_slowdown_off(&mut self, off: bool) {
         self.slowdown_off = off;
+    }
+
+    /// Test control (feature `_test-hooks`, not API): `receive`, and then the command hook called
+    /// at once for every command that arrived, which is what invariant I5.1 forbids. A test that
+    /// asserts I5.1 must fail on this.
+    #[cfg(feature = "_test-hooks")]
+    pub fn receive_calling_command_hook(
+        &mut self,
+        bytes: &[u8],
+        now_us: u64,
+        params: &mut impl ParamStore,
+        tel: &mut impl Telemetry,
+    ) {
+        self.receive(bytes, now_us, params);
+        self.call_command_hook_now(now_us, tel);
     }
 
     #[cfg(feature = "_test-hooks")]

@@ -15,7 +15,7 @@ The crate works with any HAL and any MCU that provides `embedded-io-async` 0.7 s
 - The stream scheduler: the firmware owns a slice of `StreamSlot`s and a `Telemetry` hook that is asked for each message when due.
 - A queue of 4 STATUSTEXT (`queue_text`, or `Telemetry::texts` while `run` is awaited).
 - The parameter protocol over the firmware's `ParamStore`: PARAM_REQUEST_LIST (one PARAM_VALUE per `param_list_interval_us`, 2 ms by default; a new request restarts at index 0; a store with no parameters answers with one PARAM_VALUE with `param_count` 0 and `param_index` 65535), PARAM_REQUEST_READ (by index, or by name when the index is -1), PARAM_SET (always one PARAM_VALUE with the value now in effect, also when refused). Unknown or invalid names and indices out of range get no reply.
-- Commands (COMMAND_LONG): REQUEST_MESSAGE (512) for AUTOPILOT_VERSION (148, capabilities MAVLINK2 | PARAM_ENCODE_BYTEWISE, numbers from `Config::version`), HEARTBEAT, or a stream of the table; SET_MESSAGE_INTERVAL (511) for a stream of the table. Every other command gets UNSUPPORTED and nothing else happens.
+- Commands (COMMAND_LONG): REQUEST_MESSAGE (512) for AUTOPILOT_VERSION (148, capabilities MAVLINK2 | PARAM_ENCODE_BYTEWISE, numbers from `Config::version`), HEARTBEAT, or a stream of the table; SET_MESSAGE_INTERVAL (511) for a stream of the table. Every other command addressed to the node goes to the firmware's `Telemetry::command` hook (see "Commands for the firmware"); with the default hook it gets UNSUPPORTED and nothing else happens.
 - An accept list and a hand-over hook (`Config::with_accept_list`, `Node::receive_with`): messages the node does not interpret, handed to the application after their checksum and sender are checked. See "The accept list and the hand-over".
 - RADIO_STATUS flow control: the node handles RADIO_STATUS itself and slows its streams when the radio's transmit buffer fills, as ArduPilot does. See "RADIO_STATUS slowdown".
 - `Node::run`: the async driver over `embedded_io_async::{Read, Write}` and `embedded_hal_async::delay::DelayNs`. No executor crate. It wakes at least every 100 ms.
@@ -25,7 +25,7 @@ The crate works with any HAL and any MCU that provides `embedded-io-async` 0.7 s
 - PARAM_REQUEST_LIST, PARAM_REQUEST_READ, PARAM_SET and COMMAND_LONG are acted on only when `target_system` is the node's or 0 and `target_component` is the node's or 0; otherwise `Stats::dropped_not_for_us`.
 - At most 4 replies wait (read and set echoes, ACKs, requested messages). A request that arrives when the queue is full is dropped without being acted on (a PARAM_SET does not call `set`) and counted in `Stats::dropped_reply_full`; the ground station retries. A command that has a follow-up (REQUEST_MESSAGE: the ACK, then the message) takes one place for both.
 - Values are encoded byte-wise: an `I32` travels as its own little-endian bytes in the 4-byte float field (`f32::from_bits(v as u32)`, back with `to_bits`) with type INT32; an `F32` as itself with REAL32. An `I32` whose bit pattern is a signalling NaN comes back bit-exact on the host, but this relies on the platform not altering NaN payloads when an `f32` is moved or stored (true for x86-64 SSE and for ARMv8-M with or without an FPU, as far as moves go); a platform that quiets NaNs in transit would corrupt such values. This case was not run on the board.
-- A write is refused, without calling `ParamStore::set`, when `param_type` is neither INT32 nor REAL32 or differs from the stored value's type; otherwise `set` decides: `Ok(v)` is the value in effect, `Err(_)` means refused and `get(index)` is. A PARAM_SET with a `param_type` number the dialect does not know, and a COMMAND_LONG with a command number it does not know, cannot be decoded: no reply, `Stats::dropped_malformed`.
+- A write is refused, without calling `ParamStore::set`, when `param_type` is neither INT32 nor REAL32 or differs from the stored value's type; otherwise `set` decides: `Ok(v)` is the value in effect, `Err(_)` means refused and `get(index)` is. A PARAM_SET with a `param_type` number the dialect does not know, and a COMMAND_LONG with a command number that is in neither `common` nor the project's own dialect, cannot be decoded: no reply, `Stats::dropped_malformed`.
 - SET_MESSAGE_INTERVAL: `param1` is the message id, `param2` the interval in microseconds (-1 off, 0 default, otherwise from the stream's `min_interval_us` to 10 s, whole microseconds); DENIED for an id not in the table, HEARTBEAT, `param3` not 0, or an interval outside the range. On ACCEPTED the stream restarts from now: its next sample is due at once.
 - REQUEST_MESSAGE: ACCEPTED then one copy for 148, HEARTBEAT (an extra HEARTBEAT; the 1 Hz schedule is not touched) or an id in the table (one extra `Telemetry::sample`, outside the schedule, all the frames it pushes; it waits while frames of an earlier sample are still pending); any other id is DENIED. `param2`..`param7` are ignored.
 
@@ -95,13 +95,15 @@ let end = node.run(&mut rx, &mut tx, &mut delay, || now_us(), &mut params, &mut 
 
 ## What the application provides
 
-- The `[StreamSlot]` slice, the `ParamStore`, the clock, the byte stream and the `Telemetry` hook. `Telemetry` has one required method and two provided ones (existing implementers compile unchanged):
+- The `[StreamSlot]` slice, the `ParamStore`, the clock, the byte stream and the `Telemetry` hook. `Telemetry` has one required method and four provided ones (existing implementers compile unchanged):
 
 ```rust
 pub trait Telemetry {
     fn sample(&mut self, message_id: u32, now_us: u64, out: &mut Outgoing<'_>) -> bool;
     fn status(&mut self, now_us: u64) -> Option<dialect::MavState> { None }
     fn texts(&mut self, now_us: u64, out: &mut Texts<'_>) {}
+    fn command(&mut self, req: &CommandRequest, now_us: u64) -> CommandOutcome { CommandOutcome::UNSUPPORTED }
+    fn acks(&mut self, now_us: u64) -> Option<LateAck> { None }
 }
 impl Texts<'_> {
     pub fn push(&mut self, severity: dialect::MavSeverity, text: &str) -> Result<(), Full>;
@@ -114,6 +116,16 @@ impl Texts<'_> {
   - **How soon a text goes out when the node is otherwise idle:** `next_deadline_us` knows nothing of texts the hook has not offered yet, so `run` caps its sleep at 100 ms (the cap is in `run`, not in `next_deadline_us`; a wake with nothing due changes no schedule). The hook is thus asked at least every 100 ms, and an offered text is on the wire within about 100 ms of the offer (plus the write time). A sans-IO user that sleeps until `next_deadline_us` must wake by itself at the period it wants (at most 1 s, the next heartbeat, otherwise).
   - Mixing with the plain calls is defined: `set_status` and `Telemetry::status` write the same status, the latest given wins; `queue_text` and `Texts::push` fill the same queue of 4.
 
+## Commands for the firmware
+
+COMMAND_LONG and COMMAND_ACK are decoded and encoded with the `marv_dialect::marv` types (re-exported as `mavlink_device::marv`: `common` plus the project's own messages and commands), so a command number that exists only in the project's dialect, for example `MAV_CMD_MARV_DEVICE` (42430), is a valid command and not a malformed frame. COMMAND_INT is not handled.
+
+- **What reaches the hook.** `Telemetry::command(&mut self, req: &CommandRequest, now_us) -> CommandOutcome` is called for every COMMAND_LONG addressed to the node (the addressing rule above: `target_system` the node's or 0, `target_component` the node's or 0; others are dropped and counted in `dropped_not_for_us`) that the node does not serve itself. REQUEST_MESSAGE (512) and SET_MESSAGE_INTERVAL (511) are served by the node and **never reach the hook**. `CommandRequest { command: marv::MavCmd, params: [f32; 7], sender: Peer, confirmation: u8 }`. Every received frame calls the hook once, a retransmission too (confirmation 0, then 1, ...): the firmware decides what a retransmission means; the node keeps no memory of earlier commands. A command that arrives while 4 replies wait is dropped (`dropped_reply_full`) and does not call the hook; the ground station retries. The default hook answers UNSUPPORTED.
+- **I5.1: the hook is never called from `receive`.** A command waits in the reply queue and the hook is called when that reply comes up in `poll_transmit`, so only at a moment the link may write, after a due HEARTBEAT and in order of arrival with the other replies. A command still waiting when `on_link_down` is called is dropped without calling the hook. `Telemetry::command` must not block.
+- **The outcome.** `CommandOutcome { result: marv::MavResult, progress: u8, result_param2: i32 }` (`CommandOutcome::new(result)`, `CommandOutcome::in_progress(percent)`, `CommandOutcome::UNSUPPORTED`) is sent at once as the COMMAND_ACK to the sender, with the command number, `progress` and `result_param2` (the COMMAND_ACK extension fields).
+- **The ack path for a long command.** The firmware answers IN_PROGRESS from `command`, then offers later ACKs through `Telemetry::acks(&mut self, now_us) -> Option<LateAck>` with `LateAck { command, target: Peer, outcome: CommandOutcome }`: IN_PROGRESS with a percentage as often as it wants, then the final result, each addressed to the original sender. The node asks once per `poll_transmit`, sends the ack and asks again at the next call; it keeps no queue, so nothing is allocated and a firmware hands each ack out once. Place in the order: after a due HEARTBEAT and the waiting replies, ahead of texts, list items and streams. So a reply to a ground station is never held behind a progress ACK, and an ACK that is the final result is not held behind a stream; a firmware that returned `Some` at every call would hold back the texts, the list and the streams, so it paces its progress ACKs (2 Hz, for example). Like `texts`, `acks` is not known to `next_deadline_us`: `run` wakes at least every 100 ms and asks, so an ack offered is on the wire within about 100 ms.
+- **Test control.** The feature `_test-hooks` adds `Node::receive_calling_command_hook`, `receive` followed by the hook called at once for every command that arrived (what I5.1 forbids); the I5.1 test must fail on it and a test asserts that it does.
+
 ## Rules for correct use
 
 - **Who owns what.** The firmware owns the `[StreamSlot]` slice, the `ParamStore` (storage, validation, persistence), the `Telemetry` hook, the clock, the task and the byte stream; the node owns the framing, the sequence counter, the queues and the protocol. `ParamStore::set` is called from `receive` (and so from `run`), in the link task.
@@ -123,15 +135,15 @@ impl Texts<'_> {
 - **The reader must be cancel-safe.** `run` waits for the first of `rx.read` and the timer by polling both futures by hand; when the timer wins, the read future is dropped. A read future that has taken bytes from the link and is dropped before it returns them would lose them. The `usb-cdc` reader is cancel-safe (contract section 3). The writer is only ever awaited to completion (`write_all`), and each frame is handed to it whole, so frames are never interleaved; a write error may leave a frame partly written, and `run` returns. A `Write` that returns `Ok(0)` for a non-empty buffer panics inside `write_all` (the `embedded-io` rule); the `usb-cdc` writer does not.
 - **`run` returns only** on a read error (`RunError::Read`), a write error (`RunError::Write`) or a read of 0 bytes (`RunError::EndOfStream`). It does not call `on_link_down`: the firmware does, when the link goes down (rates return to defaults, replies and the list are dropped), before it calls `run` again.
 - **Receiving.** A frame is accepted only if it is MAVLink 2 with incompatibility flags 0, its checksum is right for a message the node handles (or for a message of the accept list, with the listed CRC_EXTRA: then it is handed over by `receive_with`), and its system id is not the node's own. Dropped and counted separately in `Stats`: garbage bytes, MAVLink 1 frames, frames with any incompatibility flag (signed ones too), wrong checksums (listed messages: `dropped_listed_checksum`), frames of other messages, frames with the node's system id, frames for another target, frames that did not decode. Frames of a message that is neither handled nor listed, or with an incompatibility flag, are recognised from their header and cannot be checksum-checked; their bytes are then counted as garbage. The receive buffer is 280 bytes. A false start (a stray 0xFD) never swallows a real frame, because a candidate that fails is dropped one byte at a time and the rest is scanned again; a candidate frame is waited for until its declared length has arrived.
-- **Priority** in `poll_transmit`: a due heartbeat (the `status` hook is asked first), replies in order of arrival, queued texts (the `texts` hook is asked first, when the queue has room), the next due list item, the rest of the frames of the last sample, then due streams in slot order. A heartbeat waits for at most the frame being sent, also during a list of 300 parameters with every stream at its fastest. With a link too slow for all streams, slots late in the table are sampled less often. `next_deadline_us` is 0 while a reply, a text or a pushed frame waits, else the earliest of the next heartbeat, list item and stream; it does not know texts the hook has not offered yet, which is why `run` wakes at least every 100 ms.
+- **Priority** in `poll_transmit`: a due heartbeat (the `status` hook is asked first), replies in order of arrival (the `command` hook is called when its command's reply comes up), a later COMMAND_ACK (the `acks` hook is asked once), queued texts (the `texts` hook is asked first, when the queue has room), the next due list item, the rest of the frames of the last sample, then due streams in slot order. A heartbeat waits for at most the frame being sent, also during a list of 300 parameters with every stream at its fastest. With a link too slow for all streams, slots late in the table are sampled less often. `next_deadline_us` is 0 while a reply, a text or a pushed frame waits, else the earliest of the next heartbeat, list item and stream; it does not know texts the hook has not offered yet, which is why `run` wakes at least every 100 ms.
 - **The sequence number** is one counter for every frame; for frames pushed by the hook it is set when each is sent, so the numbers are consecutive on the wire.
 - **`on_link_down`** returns every stream to its default interval with a fresh schedule, drops queued texts, waiting replies, the parameter list in progress and pushed frames, clears the receive buffer and the presence of the ground station, and sets the stream slowdown to 0. The sequence counter, the heartbeat schedule, the status and `Stats` carry on.
-- **No failsafe.** The node takes no action when the ground station is lost, and never arms or changes a mode: arming (400) and reboot (246) get UNSUPPORTED and nothing else.
+- **No failsafe.** The node takes no action when the ground station is lost, and never arms or changes a mode: arming (400) and reboot (246) go to the `command` hook like any other command and get UNSUPPORTED from the default one; the node does nothing else.
 - A default interval of zero or less is off; one below `min_interval_us` is raised to it.
 
 ## `Stats`
 
-All counters saturate and survive `on_link_down`. Made real by the parameter protocol and commands: `dropped_not_for_us` (a target that is neither the node's nor 0), `dropped_unknown_param` (PARAM_REQUEST_READ or PARAM_SET naming no parameter: unknown or invalid name, index out of range), `dropped_reply_full` (the queue of 4 replies was full), `dropped_malformed` (now also a COMMAND_LONG with an unknown command number or a PARAM_SET with an unknown type number) and `frames_sent` (replies and list items included). `unhandled_received` is gone: nothing is unhandled any more. New: `dropped_listed_checksum` (a frame of a message on the accept list with a wrong checksum).
+All counters saturate and survive `on_link_down`. Made real by the parameter protocol and commands: `dropped_not_for_us` (a target that is neither the node's nor 0), `dropped_unknown_param` (PARAM_REQUEST_READ or PARAM_SET naming no parameter: unknown or invalid name, index out of range), `dropped_reply_full` (the queue of 4 replies was full), `dropped_malformed` (now also a COMMAND_LONG with a command number of neither `common` nor the project's dialect, or a PARAM_SET with an unknown type number) and `frames_sent` (replies and list items included). `unhandled_received` is gone: nothing is unhandled any more. New: `dropped_listed_checksum` (a frame of a message on the accept list with a wrong checksum).
 
 ## Not covered and not verified
 
@@ -172,7 +184,7 @@ With the gate switched off by a temporary edit of the firmware, `t1` did not rec
 
 ## Tests
 
-Host: `cargo test` (115 unit and property tests, 1 doc test, observed on this tree; 117 and 1 with `--all-features`, which adds the negative control of the slowdown test; `src/accept_tests.rs`: the accept list, the hand-over and the slowdown). Every frame the node emits in a test is also decoded by the `mavlink` 0.21.0 reader (dev-dependency); input frames are made by that crate. `src/service_tests.rs`: parameters and commands, `src/run_tests.rs`: `run` against a fake reader, writer and delay on a made-up clock, `src/e2e_tests.rs`: a ground-station model over a link that loses 20 % of the frames each way. `src/fuzz_tests.rs` holds the property tests: arbitrary bytes in arbitrary splits (no panic, buffer bounded), valid frames in arbitrary splits with noise between them, a real frame behind a false start, arbitrary use of the whole node.
+Host: `cargo test` (126 unit and property tests, 1 doc test, observed on this tree; 129 and 1 with `--features _test-hooks`, which adds the negative control of the slowdown test and, of the I5.1 test, and the hook that switches the slowdown off; `src/accept_tests.rs`: the accept list, the hand-over and the slowdown; `src/command_tests.rs`: 11 tests of the command and acks hooks). Every frame the node emits in a test is also decoded by the `mavlink` 0.21.0 reader (dev-dependency); input frames are made by that crate. `src/service_tests.rs`: parameters and commands, `src/run_tests.rs`: `run` against a fake reader, writer and delay on a made-up clock, `src/e2e_tests.rs`: a ground-station model over a link that loses 20 % of the frames each way. `src/fuzz_tests.rs` holds the property tests: arbitrary bytes in arbitrary splits (no panic, buffer bounded), valid frames in arbitrary splits with noise between them, a real frame behind a false start, arbitrary use of the whole node.
 
 For the target: `cargo build --target thumbv8m.main-none-eabihf`, and `cargo tree -e normal --target thumbv8m.main-none-eabihf | grep -cE 'mavlink-bindgen|quick-xml|regex|mavlink v|usb|serialport|embassy'` prints 0.
 
@@ -181,7 +193,7 @@ For the target: `cargo build --target thumbv8m.main-none-eabihf`, and `cargo tre
 | Feature | Default | Effect |
 |---|---|---|
 | `defmt` | off | `defmt::Format` on public types; enables `embedded-io-async/defmt` |
-| `_test-hooks` | off | Test-only: `Node::set_slowdown_off`. Not part of the API. |
+| `_test-hooks` | off | Test-only: `Node::set_slowdown_off`, `Node::receive_calling_command_hook`. Not part of the API. |
 
 ## Layout and licence
 
@@ -189,11 +201,12 @@ For the target: `cargo build --target thumbv8m.main-none-eabihf`, and `cargo tre
 src/lib.rs       docs, lints, exports
 src/node.rs      Node, Stats, receive, poll_transmit
 src/node/service.rs  parameter requests, commands, the reply queue, the list
+src/command.rs   CommandRequest, CommandOutcome, LateAck
 src/run.rs       Node::run, RunError
 src/deframer.rs  bounded MAVLink 2 deframer
 src/accept.rs    AcceptList, Incoming (the hand-over)
 src/config.rs    Config, VersionInfo, Stream, StreamSlot
-src/out.rs       Telemetry (sample, status, texts), Outgoing, Texts
+src/out.rs       Telemetry (sample, status, texts, command, acks), Outgoing, Texts
 src/params.rs    ParamStore, ParamName, ParamValue, ParamError
 ```
 

@@ -1,14 +1,15 @@
 //! Incoming heartbeats, parameter requests and commands, and the replies they queue.
 
 use super::{Node, Peer, sample_into};
+use crate::command::{CommandOutcome, CommandRequest};
 use crate::out::{FRAME_BUF, Telemetry};
 use crate::params::{ParamName, ParamStore, ParamValue};
 use marv_dialect::MessageData;
 use marv_dialect::common::{
-    AUTOPILOT_VERSION_DATA, COMMAND_ACK_DATA, COMMAND_LONG_DATA, HEARTBEAT_DATA, MavCmd,
-    MavParamType, MavProtocolCapability, MavResult, MavType, PARAM_REQUEST_LIST_DATA,
-    PARAM_REQUEST_READ_DATA, PARAM_SET_DATA, PARAM_VALUE_DATA,
+    AUTOPILOT_VERSION_DATA, HEARTBEAT_DATA, MavParamType, MavProtocolCapability, MavType,
+    PARAM_REQUEST_LIST_DATA, PARAM_REQUEST_READ_DATA, PARAM_SET_DATA, PARAM_VALUE_DATA,
 };
+use marv_dialect::marv::{COMMAND_ACK_DATA, COMMAND_LONG_DATA, MavCmd, MavResult};
 use marv_dialect::types::CharArray;
 
 /// Replies that can wait to be sent.
@@ -44,10 +45,13 @@ pub(super) enum Reply {
     /// A COMMAND_ACK; the entry becomes `then` once it is sent.
     Ack {
         command: MavCmd,
-        result: MavResult,
+        outcome: CommandOutcome,
         target: Peer,
         then: Option<Requested>,
     },
+    /// A command for the firmware's [`Telemetry::command`]: called when this entry comes up in
+    /// `poll_reply`, never when it is received.
+    Command(CommandRequest),
     Requested(Requested),
 }
 
@@ -213,14 +217,60 @@ impl Node<'_> {
         let (result, then) = match m.command {
             MavCmd::MAV_CMD_REQUEST_MESSAGE => self.request_message(m.param1),
             MavCmd::MAV_CMD_SET_MESSAGE_INTERVAL => (self.set_message_interval(m), None),
-            _ => (MavResult::MAV_RESULT_UNSUPPORTED, None),
+            _ => {
+                self.push_reply(Reply::Command(CommandRequest {
+                    command: m.command,
+                    params: [
+                        m.param1, m.param2, m.param3, m.param4, m.param5, m.param6, m.param7,
+                    ],
+                    sender,
+                    confirmation: m.confirmation,
+                }));
+                return;
+            }
         };
         self.push_reply(Reply::Ack {
             command: m.command,
-            result,
+            outcome: CommandOutcome::new(result),
             target: sender,
             then,
         });
+    }
+
+    /// Test control (feature `_test-hooks`) for invariant I5.1: asks the firmware's command hook
+    /// at once for every command waiting in the reply queue, as a node that called it from
+    /// `receive` would.
+    #[cfg(feature = "_test-hooks")]
+    pub(super) fn call_command_hook_now(&mut self, now_us: u64, tel: &mut impl Telemetry) {
+        for slot in self.replies.iter_mut() {
+            if let Some(Reply::Command(req)) = *slot {
+                *slot = Some(Reply::Ack {
+                    command: req.command,
+                    outcome: tel.command(&req, now_us),
+                    target: req.sender,
+                    then: None,
+                });
+            }
+        }
+    }
+
+    /// A COMMAND_ACK to `target`.
+    pub(super) fn emit_ack(
+        &mut self,
+        command: MavCmd,
+        outcome: CommandOutcome,
+        target: Peer,
+        frame: &mut [u8; FRAME_BUF],
+    ) -> Option<usize> {
+        let ack = COMMAND_ACK_DATA {
+            command,
+            result: outcome.result,
+            progress: outcome.progress,
+            result_param2: outcome.result_param2,
+            target_system: target.system_id,
+            target_component: target.component_id,
+        };
+        self.emit(&ack, frame)
     }
 
     fn in_table(&self, id: u32) -> bool {
@@ -298,7 +348,7 @@ impl Node<'_> {
                 }
                 Reply::Ack {
                     command,
-                    result,
+                    outcome,
                     target,
                     then,
                 } => {
@@ -308,14 +358,12 @@ impl Node<'_> {
                         }
                         None => self.remove_reply(i),
                     }
-                    let ack = COMMAND_ACK_DATA {
-                        command,
-                        result,
-                        target_system: target.system_id,
-                        target_component: target.component_id,
-                        ..Default::default()
-                    };
-                    return self.emit(&ack, frame);
+                    return self.emit_ack(command, outcome, target, frame);
+                }
+                Reply::Command(req) => {
+                    self.remove_reply(i);
+                    let outcome = tel.command(&req, now_us);
+                    return self.emit_ack(req.command, outcome, req.sender, frame);
                 }
                 Reply::Requested(requested) => requested,
             };

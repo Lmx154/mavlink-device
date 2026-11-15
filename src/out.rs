@@ -1,5 +1,6 @@
 //! What the telemetry hook pushes, and the hook itself.
 
+use crate::command::{CommandOutcome, CommandRequest, LateAck};
 use crate::node::Stats;
 use marv_dialect::common::{MavSeverity, MavState};
 use marv_dialect::{MAVLinkV2MessageRaw, MavHeader, MessageData};
@@ -236,5 +237,28 @@ pub trait Telemetry {
     /// with [`Texts::push`]. The default pushes nothing.
     fn texts(&mut self, now_us: u64, out: &mut Texts<'_>) {
         let _ = (now_us, out);
+    }
+
+    /// Called for every COMMAND_LONG addressed to this node that the node does not serve itself
+    /// (SET_MESSAGE_INTERVAL and REQUEST_MESSAGE never reach it), exactly once per received frame,
+    /// retransmissions included (see [`CommandRequest::confirmation`]). It is never called from
+    /// [`Node::receive`](crate::Node::receive): the command waits in the reply queue and the hook
+    /// is called when its reply comes up in [`Node::poll_transmit`](crate::Node::poll_transmit),
+    /// that is, only where the link may write. The outcome becomes the COMMAND_ACK to the sender.
+    /// Must not block. The default answers UNSUPPORTED.
+    fn command(&mut self, req: &CommandRequest, now_us: u64) -> CommandOutcome {
+        let _ = (req, now_us);
+        CommandOutcome::UNSUPPORTED
+    }
+
+    /// Called once per [`Node::poll_transmit`](crate::Node::poll_transmit), after a due HEARTBEAT
+    /// and the waiting replies, ahead of texts, list items and streams. `Some(ack)` is sent as a
+    /// COMMAND_ACK to `ack.target` and the hook is asked again at the next `poll_transmit`; `None`
+    /// sends nothing. For a long command: IN_PROGRESS with a percentage as often as the firmware
+    /// wants (the firmware paces them, 2 Hz for example), then the final result. Hand each ack out
+    /// once. The node does not queue them, so nothing is allocated. The default is `None`.
+    fn acks(&mut self, now_us: u64) -> Option<LateAck> {
+        let _ = now_us;
+        None
     }
 }
