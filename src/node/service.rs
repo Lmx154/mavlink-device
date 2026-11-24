@@ -362,8 +362,10 @@ impl Node<'_> {
                 }
                 Reply::Command(req) => {
                     self.remove_reply(i);
-                    let outcome = tel.command(&req, now_us);
-                    return self.emit_ack(req.command, outcome, req.sender, frame);
+                    match tel.command_deferrable(&req, now_us) {
+                        Some(outcome) => return self.emit_ack(req.command, outcome, req.sender, frame),
+                        None => continue,
+                    }
                 }
                 Reply::Requested(requested) => requested,
             };
@@ -387,7 +389,8 @@ impl Node<'_> {
                 }
                 Requested::Heartbeat => {
                     self.remove_reply(i);
-                    return self.emit_heartbeat(frame);
+                    let custom_mode = tel.custom_mode(now_us);
+                    return self.emit_heartbeat(custom_mode, frame);
                 }
                 Requested::Stream(id) => {
                     if self.batch.is_pending() {

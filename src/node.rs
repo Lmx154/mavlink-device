@@ -224,7 +224,8 @@ impl<'a> Node<'a> {
             if let Some(status) = tel.status(now_us) {
                 self.status = status;
             }
-            return self.emit_heartbeat(frame);
+            let custom_mode = tel.custom_mode(now_us);
+            return self.emit_heartbeat(custom_mode, frame);
         }
         if let Some(n) = self.poll_reply(now_us, params, tel, frame) {
             return Some(n);
@@ -315,6 +316,12 @@ impl<'a> Node<'a> {
         self.texts.push(&mut self.stats, severity, text)
     }
 
+    /// The `now_us` of the `receive` call that delivered the latest ground-station HEARTBEAT (`type`
+    /// MAV_TYPE_GCS); `None` before the first and after [`on_link_down`](Self::on_link_down).
+    pub fn gcs_seen_us(&self) -> Option<u64> {
+        self.gcs_seen_us
+    }
+
     /// Whether a ground-station HEARTBEAT arrived less than `gcs_timeout_us` before `now_us`. The
     /// node takes no action when it is lost.
     pub fn gcs_present(&self, now_us: u64) -> bool {
@@ -385,9 +392,9 @@ impl<'a> Node<'a> {
         self.texts.pop()
     }
 
-    fn emit_heartbeat(&mut self, frame: &mut [u8; FRAME_BUF]) -> Option<usize> {
+    fn emit_heartbeat(&mut self, custom_mode: u32, frame: &mut [u8; FRAME_BUF]) -> Option<usize> {
         let heartbeat = HEARTBEAT_DATA {
-            custom_mode: 0,
+            custom_mode,
             mavtype: self.config.vehicle_type,
             autopilot: self.config.autopilot,
             base_mode: MavModeFlag::empty(),

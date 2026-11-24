@@ -376,3 +376,144 @@ fn a_full_reply_queue_drops_the_command_without_calling_the_hook() {
     assert_eq!(acks_of(&drain(&mut node, 1, &mut fw)).len(), 4);
     assert_eq!(fw.calls.len(), 4);
 }
+
+/// A firmware that defers every command (no COMMAND_ACK from the hook) and reports `mode` in the HEARTBEAT.
+struct Deferring {
+    calls: Vec<CommandRequest>,
+    late: VecDeque<LateAck>,
+    mode: u32,
+}
+
+impl Telemetry for Deferring {
+    fn sample(&mut self, _: u32, _: u64, _: &mut Outgoing<'_>) -> bool {
+        false
+    }
+    fn command(&mut self, _: &CommandRequest, _: u64) -> CommandOutcome {
+        panic!("command_deferrable is overridden: command is not called")
+    }
+    fn command_deferrable(&mut self, req: &CommandRequest, _: u64) -> Option<CommandOutcome> {
+        self.calls.push(*req);
+        None
+    }
+    fn acks(&mut self, _: u64) -> Option<LateAck> {
+        self.late.pop_front()
+    }
+    fn custom_mode(&mut self, _: u64) -> u32 {
+        self.mode
+    }
+}
+
+/// The HEARTBEATs among `frames`, in wire order.
+fn heartbeats_of(frames: &[Vec<u8>]) -> Vec<crate::marv::HEARTBEAT_DATA> {
+    frames
+        .iter()
+        .filter(|f| u32::from_le_bytes([f[7], f[8], f[9], 0]) == crate::marv::HEARTBEAT_DATA::ID)
+        .map(|f| {
+            let len = usize::from(f[1]);
+            crate::marv::HEARTBEAT_DATA::deser(MavlinkVersion::V2, &f[10..10 + len]).unwrap()
+        })
+        .collect()
+}
+
+#[test]
+fn command_deferrable_none_sends_no_ack_and_the_late_ack_carries_the_result_to_the_sender() {
+    let mut fw = Deferring {
+        calls: Vec::new(),
+        late: VecDeque::new(),
+        mode: 0,
+    };
+    let mut node = Node::new(Config::new(1, 1), &mut []);
+    node.receive(&to_node(MavCmd::MAV_CMD_MISSION_START, [0.0; 7]), 1_000, &mut NoParams);
+    let frames = drain(&mut node, 2_000, &mut fw);
+    assert_eq!(fw.calls.len(), 1, "the hook is called once");
+    assert!(acks_of(&frames).is_empty(), "no ACK now");
+    fw.late.push_back(LateAck {
+        command: MavCmd::MAV_CMD_MISSION_START,
+        target: SENDER,
+        outcome: CommandOutcome {
+            result: MavResult::MAV_RESULT_DENIED,
+            progress: 0,
+            result_param2: 8,
+        },
+    });
+    let acks = acks_of(&drain(&mut node, 3_000, &mut fw));
+    assert_eq!(acks.len(), 1);
+    assert_eq!(acks[0].1.command, MavCmd::MAV_CMD_MISSION_START);
+    assert_eq!(acks[0].1.result, MavResult::MAV_RESULT_DENIED);
+    assert_eq!(acks[0].1.result_param2, 8);
+    assert_eq!((acks[0].1.target_system, acks[0].1.target_component), (200, 17));
+    // A second command behind the deferred one is served in turn (the reply slot was freed).
+    node.receive(&calibration(), 4_000, &mut NoParams);
+    drain(&mut node, 5_000, &mut fw);
+    assert_eq!(fw.calls.len(), 2);
+}
+
+#[test]
+fn command_deferrable_default_is_command_and_its_ack_at_once() {
+    let mut fw = Firmware::new(CommandOutcome::new(MavResult::MAV_RESULT_ACCEPTED));
+    let acks = heard_by_a_node(&calibration(), &mut fw);
+    assert_eq!(fw.calls.len(), 1);
+    assert_eq!(acks.len(), 1);
+    assert_eq!(acks[0].1.result, MavResult::MAV_RESULT_ACCEPTED);
+}
+
+#[test]
+fn custom_mode_goes_into_every_heartbeat_periodic_and_requested_and_defaults_to_0() {
+    let mut fw = Deferring {
+        calls: Vec::new(),
+        late: VecDeque::new(),
+        mode: 6,
+    };
+    let mut node = Node::new(Config::new(1, 1), &mut []);
+    let hb = heartbeats_of(&drain(&mut node, 0, &mut fw));
+    assert_eq!(hb.len(), 1);
+    assert_eq!(hb[0].custom_mode, 6);
+    fw.mode = 8;
+    // REQUEST_MESSAGE (512) for HEARTBEAT (id 0): the requested one carries the hook's value too.
+    node.receive(&to_node(MavCmd::MAV_CMD_REQUEST_MESSAGE, [0.0; 7]), 10_000, &mut NoParams);
+    let hb = heartbeats_of(&drain(&mut node, 11_000, &mut fw));
+    assert_eq!(hb.iter().map(|h| h.custom_mode).collect::<Vec<_>>(), vec![8]);
+    let hb = heartbeats_of(&drain(&mut node, 1_000_000, &mut fw));
+    assert_eq!(hb.iter().map(|h| h.custom_mode).collect::<Vec<_>>(), vec![8]);
+    // The default hook: 0.
+    let mut node = Node::new(Config::new(1, 1), &mut []);
+    let hb = heartbeats_of(&drain(&mut node, 0, &mut Plain));
+    assert_eq!(hb[0].custom_mode, 0);
+}
+
+fn heartbeat_from(mavtype: crate::marv::MavType) -> Vec<u8> {
+    let m = crate::marv::HEARTBEAT_DATA {
+        custom_mode: 0,
+        mavtype,
+        autopilot: crate::marv::MavAutopilot::MAV_AUTOPILOT_INVALID,
+        base_mode: crate::marv::MavModeFlag::empty(),
+        system_status: crate::marv::MavState::MAV_STATE_ACTIVE,
+        mavlink_version: 3,
+    };
+    let mut r = MAVLinkV2MessageRaw::new();
+    r.serialize_message_data(
+        MavHeader {
+            system_id: u32::from(SENDER.system_id),
+            component_id: SENDER.component_id,
+            sequence: 0,
+        },
+        &m,
+    );
+    r.raw_bytes().to_vec()
+}
+
+#[test]
+fn gcs_seen_us_is_the_receive_time_of_the_latest_station_heartbeat_only() {
+    let mut node = Node::new(Config::new(1, 1), &mut []);
+    assert_eq!(node.gcs_seen_us(), None);
+    node.receive(&heartbeat_from(crate::marv::MavType::MAV_TYPE_QUADROTOR), 1_000, &mut NoParams);
+    assert_eq!(node.gcs_seen_us(), None, "not a ground station");
+    node.receive(&heartbeat_from(crate::marv::MavType::MAV_TYPE_GCS), 2_000, &mut NoParams);
+    assert_eq!(node.gcs_seen_us(), Some(2_000));
+    node.receive(&heartbeat_from(crate::marv::MavType::MAV_TYPE_QUADROTOR), 3_000, &mut NoParams);
+    assert_eq!(node.gcs_seen_us(), Some(2_000));
+    node.receive(&heartbeat_from(crate::marv::MavType::MAV_TYPE_GCS), 4_000, &mut NoParams);
+    assert_eq!(node.gcs_seen_us(), Some(4_000));
+    node.on_link_down();
+    assert_eq!(node.gcs_seen_us(), None);
+}

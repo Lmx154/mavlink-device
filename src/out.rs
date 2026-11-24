@@ -232,6 +232,14 @@ pub trait Telemetry {
         None
     }
 
+    /// Called once right before each HEARTBEAT is built (the periodic one and one asked for with
+    /// REQUEST_MESSAGE): its `custom_mode`. The default is 0, the value every HEARTBEAT carried before
+    /// this hook existed.
+    fn custom_mode(&mut self, now_us: u64) -> u32 {
+        let _ = now_us;
+        0
+    }
+
     /// Called at most once per [`Node::poll_transmit`](crate::Node::poll_transmit), when no
     /// HEARTBEAT is due and no reply waits, and only while the text queue has room. Queue texts
     /// with [`Texts::push`]. The default pushes nothing.
@@ -249,6 +257,16 @@ pub trait Telemetry {
     fn command(&mut self, req: &CommandRequest, now_us: u64) -> CommandOutcome {
         let _ = (req, now_us);
         CommandOutcome::UNSUPPORTED
+    }
+
+    /// What the node calls in place of [`Telemetry::command`], at the same moment and under the same
+    /// rules. `Some(outcome)` is sent at once as the COMMAND_ACK, as `command`'s outcome is; `None`
+    /// sends no COMMAND_ACK now: the firmware then owes the sender exactly one, through
+    /// [`Telemetry::acks`] (a [`LateAck`] with the command, the sender as `target`, the result and
+    /// `result_param2`), on the same link. The default is `Some(self.command(req, now_us))`, so a
+    /// firmware that does not override it behaves as before.
+    fn command_deferrable(&mut self, req: &CommandRequest, now_us: u64) -> Option<CommandOutcome> {
+        Some(self.command(req, now_us))
     }
 
     /// Called once per [`Node::poll_transmit`](crate::Node::poll_transmit), after a due HEARTBEAT
